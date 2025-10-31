@@ -19,7 +19,6 @@ dev = [
 ]
 
 [tool.setuptools]
-namespace-packages = false
 packages = [
     "arb_engine",
     "controller",
