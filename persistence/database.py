@@ -33,11 +33,15 @@ CREATE TABLE IF NOT EXISTS arbitrage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
     event_id TEXT NOT NULL,
+    event_name TEXT,
+    sport_key TEXT,
+    commence_time TEXT,
     market_key TEXT NOT NULL,
     edge REAL NOT NULL,
     total_stake REAL NOT NULL,
     payout REAL NOT NULL,
-    stake_plan TEXT NOT NULL
+    stake_plan TEXT NOT NULL,
+    details TEXT
 );
 
 CREATE TABLE IF NOT EXISTS api_usage (
@@ -61,11 +65,15 @@ CREATE TABLE IF NOT EXISTS logs (
 class ArbitrageRecord:
     created_at: datetime
     event_id: str
+    event_name: str
+    sport_key: Optional[str]
+    commence_time: Optional[datetime]
     market_key: str
     edge: float
     total_stake: float
     payout: float
     stake_plan: Dict[str, float]
+    details: List[dict]
 
 
 @dataclass
@@ -93,6 +101,7 @@ class Database:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_arbitrage_columns(conn)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -102,6 +111,19 @@ class Database:
         finally:
             conn.commit()
             conn.close()
+
+    def _ensure_arbitrage_columns(self, conn: sqlite3.Connection) -> None:
+        """Ensure newer arbitrage columns exist for upgraded databases."""
+
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(arbitrage)")}
+        if "event_name" not in existing:
+            conn.execute("ALTER TABLE arbitrage ADD COLUMN event_name TEXT")
+        if "sport_key" not in existing:
+            conn.execute("ALTER TABLE arbitrage ADD COLUMN sport_key TEXT")
+        if "commence_time" not in existing:
+            conn.execute("ALTER TABLE arbitrage ADD COLUMN commence_time TEXT")
+        if "details" not in existing:
+            conn.execute("ALTER TABLE arbitrage ADD COLUMN details TEXT")
 
     def record_event(self, event_id: str, sport_key: str, commence_time: str, data: dict) -> None:
         with self._connect() as conn:
@@ -120,24 +142,32 @@ class Database:
     def record_arbitrage(
         self,
         event_id: str,
+        event_name: str,
+        sport_key: str,
+        commence_time: Optional[datetime],
         market_key: str,
         edge: float,
         total_stake: float,
         payout: float,
         stake_plan: Dict[str, float],
+        details: List[dict],
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO arbitrage (created_at, event_id, market_key, edge, total_stake, payout, stake_plan)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO arbitrage (created_at, event_id, event_name, sport_key, commence_time, market_key, edge, total_stake, payout, stake_plan, details)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     datetime.utcnow().isoformat(),
                     event_id,
+                    event_name,
+                    sport_key,
+                    commence_time.isoformat() if commence_time else None,
                     market_key,
                     edge,
                     total_stake,
                     payout,
                     json.dumps(stake_plan),
+                    json.dumps(details),
                 ),
             )
 
@@ -176,20 +206,44 @@ class Database:
     def history(self, limit: int = 100) -> Iterable[ArbitrageRecord]:
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT created_at, event_id, market_key, edge, total_stake, payout, stake_plan"
+                "SELECT created_at, event_id, event_name, sport_key, commence_time, market_key, edge, total_stake, payout, stake_plan, details"
                 " FROM arbitrage ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             )
             for row in cur.fetchall():
                 created_at = datetime.fromisoformat(row[0])
+                event_id = row[1]
+                event_name = row[2]
+                sport_key = row[3]
+                commence_raw = row[4]
+                commence_time = datetime.fromisoformat(commence_raw) if commence_raw else None
+                market_key = row[5]
+                edge = row[6]
+                total_stake = row[7]
+                payout = row[8]
+                stake_plan_json = row[9]
+                details_json = row[10]
+                if not event_name or commence_time is None:
+                    fallback = conn.execute(
+                        "SELECT data FROM events WHERE id = ?",
+                        (event_id,),
+                    ).fetchone()
+                    if fallback and fallback[0]:
+                        payload = json.loads(fallback[0])
+                        event_name = event_name or _derive_event_title(payload)
+                        commence_time = commence_time or _derive_commence_time(payload)
                 yield ArbitrageRecord(
                     created_at=created_at,
-                    event_id=row[1],
-                    market_key=row[2],
-                    edge=row[3],
-                    total_stake=row[4],
-                    payout=row[5],
-                    stake_plan=json.loads(row[6]),
+                    event_id=event_id,
+                    event_name=event_name or event_id,
+                    sport_key=sport_key,
+                    commence_time=commence_time,
+                    market_key=market_key,
+                    edge=edge,
+                    total_stake=total_stake,
+                    payout=payout,
+                    stake_plan=json.loads(stake_plan_json),
+                    details=json.loads(details_json) if details_json else [],
                 )
 
     def fetch_logs(self, since_id: Optional[int] = None, limit: int = 200) -> List[LogRecord]:
@@ -264,17 +318,62 @@ class Database:
         rows = list(self.history(limit=1000))
         with output.open("w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(["timestamp", "event_id", "market", "edge", "total_stake", "payout", "stake_plan"])
+            writer.writerow(
+                [
+                    "timestamp",
+                    "event_id",
+                    "event_name",
+                    "sport_key",
+                    "commence_time",
+                    "market",
+                    "edge",
+                    "total_stake",
+                    "payout",
+                    "stake_plan",
+                    "recommendations",
+                ]
+            )
             for row in rows:
                 writer.writerow(
                     [
                         row.created_at.isoformat(),
                         row.event_id,
+                        row.event_name,
+                        row.sport_key or "",
+                        row.commence_time.isoformat() if row.commence_time else "",
                         row.market_key,
                         f"{row.edge:.4f}",
                         f"{row.total_stake:.2f}",
                         f"{row.payout:.2f}",
                         json.dumps(row.stake_plan),
+                        json.dumps(row.details),
                     ]
                 )
         return output
+
+
+def _derive_event_title(payload: dict) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    home = payload.get("home_team")
+    away = payload.get("away_team")
+    if home and away:
+        return f"{away} @ {home}"
+    title = payload.get("sport_title") or payload.get("title")
+    if isinstance(title, str):
+        return title
+    return None
+
+
+def _derive_commence_time(payload: dict) -> Optional[datetime]:
+    if not isinstance(payload, dict):
+        return None
+    commence_value = payload.get("commence_time")
+    if not isinstance(commence_value, str):
+        return None
+    try:
+        if commence_value.endswith("Z"):
+            return datetime.fromisoformat(commence_value.replace("Z", "+00:00"))
+        return datetime.fromisoformat(commence_value)
+    except ValueError:
+        return None

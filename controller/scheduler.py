@@ -18,6 +18,7 @@ from arb_engine.calculations import (
     select_best_prices,
 )
 from normalize.names import NameNormalizer
+from odds_client.catalog import get_bookmaker_info
 from persistence.database import Database
 
 try:
@@ -40,6 +41,21 @@ class ScanSchedule:
 
 
 @dataclass
+class RescanResult:
+    """Outcome from a manual opportunity rescan."""
+
+    event_id: str
+    sport_key: str
+    market_key: str
+    event_name: str
+    commence_time: Optional[datetime]
+    within_window: bool
+    quotes_considered: int
+    opportunity: Optional[ArbitrageOpportunity]
+    status: str
+
+
+@dataclass
 class ScanConfig:
     sports: List[str]
     regions: List[str]
@@ -51,6 +67,7 @@ class ScanConfig:
     min_edge: Decimal
     bankroll: Decimal
     rounding: Decimal
+    deep_market_map: Dict[str, List[str]] = field(default_factory=dict)
     min_book_count: int = 2
     max_stake_per_book: Decimal | None = None
     scan_mode: ScanMode = ScanMode.SNAPSHOT
@@ -91,6 +108,179 @@ class ScanController:
             self._thread.join(timeout=5)
         self._thread = None
         self._db.log("info", "Scanning stopped")
+
+    def rescan_opportunity(
+        self,
+        config: ScanConfig,
+        event_id: str,
+        sport_key: str,
+        market_key: str,
+    ) -> RescanResult:
+        """Re-evaluate a previously detected opportunity."""
+
+        window_start = _to_utc_naive(config.window_start)
+        window_end = _to_utc_naive(config.window_end)
+        try:
+            response = self._client.get_odds(
+                sport_key=sport_key,
+                regions=config.regions,
+                bookmakers=config.bookmakers,
+                markets=config.markets,
+            )
+        except Exception as exc:
+            self._db.log(
+                "error",
+                "Rescan odds fetch failed",
+                {"event_id": event_id, "sport": sport_key, "error": str(exc)},
+            )
+            raise
+
+        self._db.log_api_usage(response.remaining_requests, response.reset_time)
+        events = response.data or []
+        if isinstance(events, dict):
+            events = [events]
+
+        target_event: Optional[dict] = None
+        for event in events:
+            if isinstance(event, dict) and event.get("id") == event_id:
+                target_event = event
+                break
+
+        if not target_event:
+            self._db.log(
+                "info",
+                "Rescan event not returned",
+                {"event_id": event_id, "sport": sport_key},
+            )
+            return RescanResult(
+                event_id=event_id,
+                sport_key=sport_key,
+                market_key=market_key,
+                event_name=event_id,
+                commence_time=None,
+                within_window=False,
+                quotes_considered=0,
+                opportunity=None,
+                status="event_not_found",
+            )
+
+        commence_time_raw = _parse_time(target_event.get("commence_time"))
+        commence_time = _to_utc_naive(commence_time_raw) if commence_time_raw else None
+        within_window = True
+        if commence_time:
+            within_window = window_start <= commence_time <= window_end
+
+        if commence_time:
+            commence_str = commence_time.isoformat()
+        else:
+            commence_str = target_event.get("commence_time") or ""
+
+        self._db.record_event(event_id, sport_key, commence_str, target_event)
+
+        allowed_deep = set(config.deep_markets)
+        allowed_deep.update(config.deep_market_map.get(sport_key, []))
+        if market_key not in config.markets:
+            allowed_deep.add(market_key)
+
+        market_quotes: Dict[str, List[OutcomePrice]] = {}
+        quotes_collected = self._collect_market_quotes(
+            event_id,
+            target_event.get("bookmakers", []),
+            market_quotes,
+            config,
+            allowed_deep,
+        )
+
+        deep_keys = list(sorted(allowed_deep))
+        if deep_keys:
+            deep_data = self._fetch_deep_markets(sport_key, event_id, config, deep_keys)
+            if deep_data:
+                quotes_collected += self._collect_market_quotes(
+                    event_id,
+                    deep_data.get("bookmakers", []),
+                    market_quotes,
+                    config,
+                    allowed_deep,
+                )
+
+        event_name = _event_title(target_event)
+        quotes = market_quotes.get(market_key, [])
+        if not quotes:
+            self._db.log(
+                "info",
+                "Rescan market unavailable",
+                {
+                    "event_id": event_id,
+                    "sport": sport_key,
+                    "market": market_key,
+                    "quotes_collected": quotes_collected,
+                },
+            )
+            return RescanResult(
+                event_id=event_id,
+                sport_key=sport_key,
+                market_key=market_key,
+                event_name=event_name,
+                commence_time=commence_time,
+                within_window=within_window,
+                quotes_considered=0,
+                opportunity=None,
+                status="no_quotes",
+            )
+
+        best_prices = select_best_prices(quotes)
+        opportunity = detect_arbitrage(
+            prices=best_prices,
+            min_edge=config.min_edge,
+            bankroll=config.bankroll,
+            rounding=config.rounding,
+            max_per_book=config.max_stake_per_book,
+        )
+
+        if opportunity:
+            self._db.log(
+                "info",
+                "Rescan opportunity confirmed",
+                {
+                    "event_id": event_id,
+                    "sport": sport_key,
+                    "market": market_key,
+                    "edge": float(opportunity.edge),
+                },
+            )
+            return RescanResult(
+                event_id=event_id,
+                sport_key=sport_key,
+                market_key=market_key,
+                event_name=event_name,
+                commence_time=commence_time,
+                within_window=within_window,
+                quotes_considered=len(quotes),
+                opportunity=opportunity,
+                status="arbitrage",
+            )
+
+        self._db.log(
+            "info",
+            "Rescan found no arbitrage",
+            {
+                "event_id": event_id,
+                "sport": sport_key,
+                "market": market_key,
+                "quotes": len(quotes),
+            },
+        )
+        return RescanResult(
+            event_id=event_id,
+            sport_key=sport_key,
+            market_key=market_key,
+            event_name=event_name,
+            commence_time=commence_time,
+            within_window=within_window,
+            quotes_considered=len(quotes),
+            opportunity=None,
+            status="no_arbitrage",
+        )
 
     def _run_loop(self) -> None:
         assert self._config is not None
@@ -186,6 +376,9 @@ class ScanController:
         if isinstance(events, dict):
             events = [events]
 
+        allowed_deep_markets = set(config.deep_markets)
+        allowed_deep_markets.update(config.deep_market_map.get(sport, []))
+
         for event in events:
             if not isinstance(event, dict):
                 continue
@@ -214,17 +407,21 @@ class ScanController:
                 event.get("bookmakers", []),
                 market_quotes,
                 config,
+                allowed_deep_markets,
             )
 
-            if config.deep_markets:
-                deep_data = self._fetch_deep_markets(sport, event_id, config)
-                if deep_data:
-                    quotes_collected += self._collect_market_quotes(
-                        event_id,
-                        deep_data.get("bookmakers", []),
-                        market_quotes,
-                        config,
-                    )
+            deep_market_keys = self._determine_deep_markets(sport, config)
+            deep_data: Optional[dict] = None
+            if deep_market_keys:
+                deep_data = self._fetch_deep_markets(sport, event_id, config, deep_market_keys)
+            if deep_data:
+                quotes_collected += self._collect_market_quotes(
+                    event_id,
+                    deep_data.get("bookmakers", []),
+                    market_quotes,
+                    config,
+                    allowed_deep_markets,
+                )
 
             for market_key, quotes in market_quotes.items():
                 markets_seen += 1
@@ -239,7 +436,16 @@ class ScanController:
                     max_per_book=config.max_stake_per_book,
                 )
                 if opportunity:
-                    self._handle_opportunity(event_id, market_key, opportunity)
+                    event_name = _event_title(event)
+                    commence = _parse_time(event.get("commence_time"))
+                    self._handle_opportunity(
+                        event_id,
+                        event_name,
+                        sport,
+                        commence,
+                        market_key,
+                        opportunity,
+                    )
                     opportunities_found += 1
         context = {
             "events_received": len(events),
@@ -253,14 +459,40 @@ class ScanController:
         }
         return upcoming_within_burst, opportunities_found, events_considered, context
 
-    def _handle_opportunity(self, event_id: str, market_key: str, opportunity: ArbitrageOpportunity) -> None:
+    def _handle_opportunity(
+        self,
+        event_id: str,
+        event_name: str,
+        sport_key: str,
+        commence_time: Optional[datetime],
+        market_key: str,
+        opportunity: ArbitrageOpportunity,
+    ) -> None:
+        details = [
+            {
+                "label": rec.label,
+                "bookmaker_key": rec.bookmaker_key,
+                "bookmaker_title": rec.bookmaker_title,
+                "regions": list(rec.bookmaker_regions),
+                "american_odds": rec.american_odds,
+                "decimal_odds": float(rec.decimal_odds),
+                "stake": float(rec.stake),
+                "point": rec.point,
+                "url": rec.url,
+            }
+            for rec in opportunity.recommendations
+        ]
         self._db.record_arbitrage(
             event_id=event_id,
+            event_name=event_name,
+            sport_key=sport_key,
+            commence_time=commence_time,
             market_key=market_key,
             edge=float(opportunity.edge),
             total_stake=float(opportunity.total_stake),
             payout=float(opportunity.payout),
             stake_plan={k: float(v) for k, v in opportunity.stake_plan.items()},
+            details=details,
         )
         self._db.log(
             "info",
@@ -272,21 +504,33 @@ class ScanController:
             },
         )
 
+    def _determine_deep_markets(self, sport: str, config: ScanConfig) -> List[str]:
+        if sport in config.deep_market_map:
+            return config.deep_market_map[sport]
+        return config.deep_markets
+
     def _collect_market_quotes(
         self,
         event_id: str,
         bookmakers: Iterable[dict],
         market_quotes: Dict[str, List[OutcomePrice]],
         config: ScanConfig,
+        allowed_deep_markets: Iterable[str],
     ) -> int:
         collected = 0
+        deep_market_set = {market for market in allowed_deep_markets}
         for bookmaker in bookmakers:
             markets = bookmaker.get("markets", [])
             for market in markets:
                 market_key = market.get("key")
-                if market_key not in config.markets and market_key not in config.deep_markets:
+                if market_key not in config.markets and market_key not in deep_market_set:
                     continue
                 quotes = market_quotes.setdefault(market_key, [])
+                book_key = bookmaker.get("key", "unknown")
+                book_title = bookmaker.get("title") or book_key
+                info = get_bookmaker_info(book_key)
+                regions = tuple(info.regions) if info else ()
+                url = info.url if info else None
                 for outcome in market.get("outcomes", []):
                     name = outcome.get("name")
                     price = outcome.get("price")
@@ -302,29 +546,38 @@ class ScanController:
                     quotes.append(
                         OutcomePrice(
                             outcome_name=canonical,
-                            bookmaker=bookmaker.get("title") or bookmaker.get("key", "unknown"),
+                            bookmaker_key=book_key,
+                            bookmaker_title=book_title,
                             american_odds=american,
                             decimal_odds=decimal_odds,
                             point=point,
+                            bookmaker_regions=regions,
+                            bookmaker_url=url,
                         )
                     )
                     collected += 1
                 self._db.record_quotes(
                     event_id=event_id,
                     market_key=market_key,
-                    bookmaker=bookmaker.get("key", "unknown"),
+                    bookmaker=book_key,
                     data=market,
                 )
         return collected
 
-    def _fetch_deep_markets(self, sport: str, event_id: str, config: ScanConfig) -> Optional[dict]:
+    def _fetch_deep_markets(
+        self,
+        sport: str,
+        event_id: str,
+        config: ScanConfig,
+        markets: List[str],
+    ) -> Optional[dict]:
         try:
             response = self._client.get_event_odds(
                 sport_key=sport,
                 event_id=event_id,
                 regions=config.regions,
                 bookmakers=config.bookmakers,
-                markets=config.deep_markets,
+                markets=markets,
             )
         except Exception as exc:
             self._db.log("warning", "Deep market fetch failed", {"event": event_id, "error": str(exc)})
@@ -353,3 +606,16 @@ def _to_utc_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _event_title(event: dict) -> str:
+    """Best-effort human readable name for an event."""
+
+    home = event.get("home_team") if isinstance(event, dict) else None
+    away = event.get("away_team") if isinstance(event, dict) else None
+    if home and away:
+        return f"{away} @ {home}"
+    name = event.get("sport_title") if isinstance(event, dict) else None
+    if name:
+        return name
+    return event.get("id", "Unknown event") if isinstance(event, dict) else "Unknown event"

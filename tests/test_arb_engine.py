@@ -15,20 +15,50 @@ def test_american_to_decimal_positive():
 def test_detect_arbitrage_identifies_opportunity():
     prices = select_best_prices(
         [
-            OutcomePrice("Team A", "book1", -110, american_to_decimal(-110)),
-            OutcomePrice("Team B", "book2", 120, american_to_decimal(120)),
+            OutcomePrice(
+                "Team A",
+                "book1",
+                "Book One",
+                -110,
+                american_to_decimal(-110),
+                bookmaker_regions=("us",),
+            ),
+            OutcomePrice(
+                "Team B",
+                "book2",
+                "Book Two",
+                120,
+                american_to_decimal(120),
+                bookmaker_regions=("us",),
+            ),
         ]
     )
     opportunity = detect_arbitrage(prices, min_edge=Decimal("0.001"), bankroll=Decimal("100"), rounding=Decimal("0.01"))
     assert opportunity is not None
     assert opportunity.edge > 0
+    assert len(opportunity.recommendations) == 2
+    assert {rec.bookmaker_key for rec in opportunity.recommendations} == {"book1", "book2"}
 
 
 def test_detect_arbitrage_honors_max_per_book_filter():
     prices = select_best_prices(
         [
-            OutcomePrice("Team A", "book1", -110, american_to_decimal(-110)),
-            OutcomePrice("Team B", "book2", 120, american_to_decimal(120)),
+            OutcomePrice(
+                "Team A",
+                "book1",
+                "Book One",
+                -110,
+                american_to_decimal(-110),
+                bookmaker_regions=("us",),
+            ),
+            OutcomePrice(
+                "Team B",
+                "book2",
+                "Book Two",
+                120,
+                american_to_decimal(120),
+                bookmaker_regions=("us",),
+            ),
         ]
     )
     opportunity = detect_arbitrage(
@@ -44,8 +74,22 @@ def test_detect_arbitrage_honors_max_per_book_filter():
 def test_detect_arbitrage_uses_actual_payout_after_rounding():
     prices = select_best_prices(
         [
-            OutcomePrice("Team A", "book1", -101, american_to_decimal(-101)),
-            OutcomePrice("Team B", "book2", 102, american_to_decimal(102)),
+            OutcomePrice(
+                "Team A",
+                "book1",
+                "Book One",
+                -101,
+                american_to_decimal(-101),
+                bookmaker_regions=("us",),
+            ),
+            OutcomePrice(
+                "Team B",
+                "book2",
+                "Book Two",
+                102,
+                american_to_decimal(102),
+                bookmaker_regions=("us",),
+            ),
         ]
     )
     opportunity = detect_arbitrage(

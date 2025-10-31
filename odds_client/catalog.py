@@ -11,7 +11,7 @@ category to make maintenance straightforward.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,7 @@ class BookmakerInfo:
     key: str
     title: str
     regions: Sequence[str]
+    url: Optional[str] = None
 
 
 # NOTE: Keep this list sorted first by group, then by sport key.
@@ -183,48 +184,50 @@ ALL_SPORTS: List[SportInfo] = [
 # NOTE: Keep bookmaker entries sorted alphabetically by key.
 ALL_BOOKMAKERS: List[BookmakerInfo] = [
     BookmakerInfo("atswins", "ATSwins", ("us",)),
-    BookmakerInfo("ballybet", "Bally Bet", ("us",)),
-    BookmakerInfo("barstool", "Barstool Sportsbook", ("us",)),
-    BookmakerInfo("bet365", "bet365", ("uk", "us", "au", "eu")),
-    BookmakerInfo("betfred", "Betfred", ("uk", "us")),
-    BookmakerInfo("betmgm", "BetMGM", ("us",)),
-    BookmakerInfo("betparx", "BetParx", ("us",)),
+    BookmakerInfo("ballybet", "Bally Bet", ("us",), "https://www.ballybet.com"),
+    BookmakerInfo("barstool", "Barstool Sportsbook", ("us",), "https://www.barstoolsportsbook.com"),
+    BookmakerInfo("bet365", "bet365", ("uk", "us", "au", "eu"), "https://www.bet365.com"),
+    BookmakerInfo("betfred", "Betfred", ("uk", "us"), "https://www.betfred.com"),
+    BookmakerInfo("betmgm", "BetMGM", ("us",), "https://www.betmgm.com"),
+    BookmakerInfo("betparx", "BetParx", ("us",), "https://www.betparx.com"),
     BookmakerInfo("betpoint", "Betpoint", ("eu",)),
-    BookmakerInfo("betrivers", "BetRivers", ("us", "ca")),
-    BookmakerInfo("betsafe", "Betsafe", ("eu")),
-    BookmakerInfo("betsson", "Betsson", ("eu")),
-    BookmakerInfo("betstar", "Betstar", ("au")),
-    BookmakerInfo("betus", "BetUS", ("us")),
-    BookmakerInfo("bovada", "Bovada", ("us")),
-    BookmakerInfo("caesars", "Caesars", ("us")),
-    BookmakerInfo("circasports", "Circa Sports", ("us")),
-    BookmakerInfo("cloudbet", "Cloudbet", ("uk", "eu")),
-    BookmakerInfo("coolbet", "Coolbet", ("eu")),
-    BookmakerInfo("dafabet", "Dafabet", ("uk", "eu")),
-    BookmakerInfo("draftkings", "DraftKings", ("us", "ca")),
-    BookmakerInfo("espnbet", "ESPN BET", ("us",)),
-    BookmakerInfo("fanduel", "FanDuel", ("us", "uk", "ca")),
-    BookmakerInfo("foxbet", "FOX Bet", ("us")),
-    BookmakerInfo("ladbrokes", "Ladbrokes", ("uk", "au")),
-    BookmakerInfo("lowvig", "LowVig", ("us")),
-    BookmakerInfo("neds", "Neds", ("au")),
-    BookmakerInfo("northstarbets", "NorthStar Bets", ("ca")),
-    BookmakerInfo("pinnacle", "Pinnacle", ("uk", "eu")),
-    BookmakerInfo("playup", "PlayUp", ("us", "au")),
-    BookmakerInfo("pointsbetau", "PointsBet AU", ("au")),
-    BookmakerInfo("pointsbetus", "PointsBet US", ("us")),
-    BookmakerInfo("sugarhouse", "SugarHouse", ("us")),
-    BookmakerInfo("superbook", "SuperBook", ("us")),
-    BookmakerInfo("tab", "TAB", ("au")),
-    BookmakerInfo("twinspires", "TwinSpires", ("us")),
-    BookmakerInfo("unibet_eu", "Unibet EU", ("eu")),
-    BookmakerInfo("unibet_us", "Unibet US", ("us")),
-    BookmakerInfo("unibet_uk", "Unibet UK", ("uk")),
+    BookmakerInfo("betrivers", "BetRivers", ("us", "ca"), "https://www.betrivers.com"),
+    BookmakerInfo("betsafe", "Betsafe", ("eu",), "https://www.betsafe.com"),
+    BookmakerInfo("betsson", "Betsson", ("eu",), "https://www.betsson.com"),
+    BookmakerInfo("betstar", "Betstar", ("au",), "https://www.betstar.com.au"),
+    BookmakerInfo("betus", "BetUS", ("us",), "https://www.betus.com.pa"),
+    BookmakerInfo("bovada", "Bovada", ("us",), "https://www.bovada.lv"),
+    BookmakerInfo("caesars", "Caesars", ("us",), "https://www.caesars.com/sportsbook"),
+    BookmakerInfo("circasports", "Circa Sports", ("us",), "https://www.circasports.com"),
+    BookmakerInfo("cloudbet", "Cloudbet", ("uk", "eu"), "https://www.cloudbet.com"),
+    BookmakerInfo("coolbet", "Coolbet", ("eu",), "https://www.coolbet.com"),
+    BookmakerInfo("dafabet", "Dafabet", ("uk", "eu"), "https://www.dafabet.com"),
+    BookmakerInfo("draftkings", "DraftKings", ("us", "ca"), "https://www.draftkings.com"),
+    BookmakerInfo("espnbet", "ESPN BET", ("us",), "https://www.espnbet.com"),
+    BookmakerInfo("fanduel", "FanDuel", ("us", "uk", "ca"), "https://www.fanduel.com"),
+    BookmakerInfo("foxbet", "FOX Bet", ("us",)),
+    BookmakerInfo("ladbrokes", "Ladbrokes", ("uk", "au"), "https://www.ladbrokes.com"),
+    BookmakerInfo("lowvig", "LowVig", ("us",), "https://www.lowvig.ag"),
+    BookmakerInfo("neds", "Neds", ("au",), "https://www.neds.com.au"),
+    BookmakerInfo("northstarbets", "NorthStar Bets", ("ca",), "https://www.northstarbets.ca"),
+    BookmakerInfo("pinnacle", "Pinnacle", ("uk", "eu"), "https://www.pinnacle.com"),
+    BookmakerInfo("playup", "PlayUp", ("us", "au"), "https://www.playup.com"),
+    BookmakerInfo("pointsbetau", "PointsBet AU", ("au",), "https://pointsbet.com.au"),
+    BookmakerInfo("pointsbetus", "PointsBet US", ("us",), "https://pointsbet.com"),
+    BookmakerInfo("sugarhouse", "SugarHouse", ("us",), "https://www.playsugarhouse.com"),
+    BookmakerInfo("superbook", "SuperBook", ("us",), "https://www.superbook.com"),
+    BookmakerInfo("tab", "TAB", ("au",), "https://www.tab.com.au"),
+    BookmakerInfo("twinspires", "TwinSpires", ("us",), "https://www.twinspires.com/sports"),
+    BookmakerInfo("unibet_eu", "Unibet EU", ("eu",), "https://www.unibet.eu"),
+    BookmakerInfo("unibet_us", "Unibet US", ("us",), "https://pa.unibet.com"),
+    BookmakerInfo("unibet_uk", "Unibet UK", ("uk",), "https://www.unibet.co.uk"),
     BookmakerInfo("williamhill_au", "William Hill AU", ("au")),
-    BookmakerInfo("williamhill_uk", "William Hill UK", ("uk")),
-    BookmakerInfo("williamhill_us", "William Hill US", ("us")),
-    BookmakerInfo("wynnbet", "WynnBET", ("us")),
+    BookmakerInfo("williamhill_uk", "William Hill UK", ("uk",), "https://www.williamhill.com"),
+    BookmakerInfo("williamhill_us", "William Hill US", ("us",)),
+    BookmakerInfo("wynnbet", "WynnBET", ("us",), "https://www.wynnbet.com"),
 ]
+
+BOOKMAKER_INDEX: Dict[str, BookmakerInfo] = {book.key: book for book in ALL_BOOKMAKERS}
 
 
 def filter_bookmakers_by_regions(regions: Iterable[str]) -> List[BookmakerInfo]:
@@ -238,4 +241,10 @@ def filter_bookmakers_by_regions(regions: Iterable[str]) -> List[BookmakerInfo]:
         for bookmaker in ALL_BOOKMAKERS
         if any(region in region_set for region in bookmaker.regions)
     ]
+
+
+def get_bookmaker_info(key: str) -> Optional[BookmakerInfo]:
+    """Return the known bookmaker metadata for a key, if available."""
+
+    return BOOKMAKER_INDEX.get(key)
 

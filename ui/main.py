@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from PySide6.QtCore import QDateTime, QRunnable, Qt, QThreadPool, Signal, Slot, QTimer
 from PySide6.QtGui import QAction
@@ -20,6 +23,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -46,7 +50,7 @@ from odds_client.catalog import (
 )
 from odds_client.deep_markets import get_deep_markets_for_sport
 from odds_client.client import OddsApiClient
-from persistence.database import Database
+from persistence.database import ArbitrageRecord, Database, LogRecord
 
 
 class SnapshotRunnable(QRunnable):
@@ -59,6 +63,82 @@ class SnapshotRunnable(QRunnable):
         self._controller.run_snapshot(self._config)
 
 
+@dataclass
+class SelectionItem:
+    key: str
+    label: str
+    description: str = ""
+
+
+class MultiSelectDialog(QDialog):
+    def __init__(
+        self,
+        title: str,
+        items: Sequence[SelectionItem],
+        selected: Sequence[str],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self._items = list(items)
+        self.selected_keys: List[str] = list(selected)
+        self._build_ui(selected)
+
+    def _build_ui(self, selected: Sequence[str]) -> None:
+        layout = QVBoxLayout(self)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Filter…")
+        layout.addWidget(self.search_edit)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.MultiSelection)
+        selected_set = set(selected)
+        for item in self._items:
+            entry = QListWidgetItem(item.label)
+            entry.setData(Qt.UserRole, item.key)
+            if item.description:
+                entry.setToolTip(item.description)
+            if item.key in selected_set:
+                entry.setSelected(True)
+            self.list_widget.addItem(entry)
+        layout.addWidget(self.list_widget)
+
+        button_row = QHBoxLayout()
+        self.select_all_button = QPushButton("Select all")
+        self.clear_button = QPushButton("Clear")
+        self.ok_button = QPushButton("OK")
+        self.cancel_button = QPushButton("Cancel")
+        button_row.addWidget(self.select_all_button)
+        button_row.addWidget(self.clear_button)
+        button_row.addStretch()
+        button_row.addWidget(self.ok_button)
+        button_row.addWidget(self.cancel_button)
+        layout.addLayout(button_row)
+
+        self.search_edit.textChanged.connect(self._filter_items)
+        self.select_all_button.clicked.connect(self._select_all)
+        self.clear_button.clicked.connect(self._clear_selection)
+        self.ok_button.clicked.connect(self._accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+    def _filter_items(self, text: str) -> None:
+        query = text.casefold()
+        for index in range(self.list_widget.count()):
+            item = self.list_widget.item(index)
+            item.setHidden(bool(query and query not in item.text().casefold()))
+
+    def _select_all(self) -> None:
+        for index in range(self.list_widget.count()):
+            self.list_widget.item(index).setSelected(True)
+
+    def _clear_selection(self) -> None:
+        self.list_widget.clearSelection()
+
+    def _accept(self) -> None:
+        self.selected_keys = [item.data(Qt.UserRole) for item in self.list_widget.selectedItems()]
+        self.accept()
+
 class SettingsTab(QWidget):
     config_applied = Signal(ScanConfig, OddsApiClient)
 
@@ -67,8 +147,11 @@ class SettingsTab(QWidget):
         self._db = database
         self._thread_pool = QThreadPool.globalInstance()
         self._client: Optional[OddsApiClient] = None
-        self._sports: List[str] = [sport.key for sport in ALL_SPORTS]
-        self._bookmakers: List[str] = [book.key for book in ALL_BOOKMAKERS]
+        self._available_sports: List[SportInfo] = list(ALL_SPORTS)
+        self._available_bookmakers: List[BookmakerInfo] = list(ALL_BOOKMAKERS)
+        self._selected_sports: List[str] = [sport.key for sport in self._available_sports]
+        self._selected_bookmakers: List[str] = [book.key for book in self._available_bookmakers]
+        self._per_sport_deep_markets: Dict[str, List[str]] = {}
         self._markets = ["h2h", "spreads", "totals"]
         self._regions = ["us", "uk", "eu", "au"]
         self._window_presets = {
@@ -96,15 +179,27 @@ class SettingsTab(QWidget):
             self.region_box.addItem(item)
         form_layout.addRow("Regions", self.region_box)
 
-        self.sports_box = QListWidget()
-        self.sports_box.setSelectionMode(QListWidget.MultiSelection)
-        self._populate_sport_list(ALL_SPORTS)
-        form_layout.addRow("Sports", self.sports_box)
+        sports_row = QHBoxLayout()
+        self.sports_summary = QLabel()
+        self.sports_summary.setWordWrap(True)
+        self.sports_summary.setMinimumWidth(300)
+        self.sports_browse_button = QPushButton("Browse…")
+        sports_row.addWidget(self.sports_summary, 1)
+        sports_row.addWidget(self.sports_browse_button)
+        sports_widget = QWidget()
+        sports_widget.setLayout(sports_row)
+        form_layout.addRow("Sports", sports_widget)
 
-        self.books_box = QListWidget()
-        self.books_box.setSelectionMode(QListWidget.MultiSelection)
-        self._populate_bookmaker_list(ALL_BOOKMAKERS, select_all=True)
-        form_layout.addRow("Bookmakers", self.books_box)
+        books_row = QHBoxLayout()
+        self.bookmakers_summary = QLabel()
+        self.bookmakers_summary.setWordWrap(True)
+        self.bookmakers_summary.setMinimumWidth(300)
+        self.bookmakers_browse_button = QPushButton("Browse…")
+        books_row.addWidget(self.bookmakers_summary, 1)
+        books_row.addWidget(self.bookmakers_browse_button)
+        books_widget = QWidget()
+        books_widget.setLayout(books_row)
+        form_layout.addRow("Bookmakers", books_widget)
 
         self.markets_box = QListWidget()
         self.markets_box.setSelectionMode(QListWidget.MultiSelection)
@@ -123,6 +218,10 @@ class SettingsTab(QWidget):
         deep_market_widget = QWidget()
         deep_market_widget.setLayout(deep_market_row)
         form_layout.addRow("Deep markets", deep_market_widget)
+
+        self.deep_market_summary = QLabel("Applies to all selected sports")
+        self.deep_market_summary.setWordWrap(True)
+        form_layout.addRow("Overrides", self.deep_market_summary)
 
         self.window_preset_combo = QComboBox()
         self.window_preset_combo.addItems(["Custom range", *self._window_presets.keys()])
@@ -196,7 +295,12 @@ class SettingsTab(QWidget):
         self.apply_button.clicked.connect(self._on_apply)
         self.window_preset_combo.currentTextChanged.connect(self._on_preset_changed)
         self.deep_market_browser.clicked.connect(self._open_deep_market_browser)
+        self.sports_browse_button.clicked.connect(self._open_sport_browser)
+        self.bookmakers_browse_button.clicked.connect(self._open_bookmaker_browser)
         self._on_preset_changed(self.window_preset_combo.currentText())
+        self._refresh_sport_summary()
+        self._refresh_bookmaker_summary()
+        self._refresh_deep_market_summary()
 
     def _selected_items(self, widget: QListWidget) -> List[str]:
         selections: List[str] = []
@@ -205,31 +309,82 @@ class SettingsTab(QWidget):
             selections.append(key if key else item.text())
         return selections
 
-    def _populate_sport_list(self, sports: List[SportInfo]) -> None:
-        self.sports_box.clear()
-        for sport in sports:
-            item = QListWidgetItem(f"{sport.key} — {sport.title}")
-            item.setData(Qt.UserRole, sport.key)
-            self.sports_box.addItem(item)
+    def _refresh_sport_summary(self) -> None:
+        label_map = {sport.key: f"{sport.title} ({sport.group})" for sport in self._available_sports}
+        summary = self._format_selection_summary(self._selected_sports, label_map, len(self._available_sports))
+        self.sports_summary.setText(summary)
 
-    def _populate_bookmaker_list(
-        self, bookmakers: List[BookmakerInfo], *, select_all: bool = False
-    ) -> None:
-        self.books_box.clear()
-        for bookmaker in bookmakers:
-            item = QListWidgetItem(f"{bookmaker.key} — {bookmaker.title}")
-            item.setData(Qt.UserRole, bookmaker.key)
-            item.setSelected(select_all)
-            self.books_box.addItem(item)
+    def _refresh_bookmaker_summary(self) -> None:
+        label_map = {
+            book.key: f"{book.title} [{'/'.join(book.regions)}]"
+            for book in self._available_bookmakers
+        }
+        summary = self._format_selection_summary(self._selected_bookmakers, label_map, len(self._available_bookmakers))
+        self.bookmakers_summary.setText(summary)
+
+    def _format_selection_summary(
+        self,
+        selected_keys: Sequence[str],
+        label_map: Dict[str, str],
+        total_available: int,
+    ) -> str:
+        if not selected_keys or set(selected_keys) == set(label_map.keys()):
+            return f"All ({total_available})"
+        names = [label_map[key] for key in selected_keys if key in label_map]
+        if not names:
+            return "None selected"
+        if len(names) > 5:
+            return ", ".join(names[:5]) + f" … (+{len(names) - 5} more)"
+        return ", ".join(names)
+
+    def _open_sport_browser(self) -> None:
+        items = [
+            SelectionItem(key=sport.key, label=f"{sport.title} ({sport.group})", description=sport.key)
+            for sport in self._available_sports
+        ]
+        dialog = MultiSelectDialog("Select sports", items, self._selected_sports, self)
+        if dialog.exec() == QDialog.Accepted:
+            self._selected_sports = dialog.selected_keys or [sport.key for sport in self._available_sports]
+            self._refresh_sport_summary()
+
+    def _open_bookmaker_browser(self) -> None:
+        items = [
+            SelectionItem(
+                key=book.key,
+                label=f"{book.title} ({'/'.join(book.regions)})",
+                description=(book.url or book.key),
+            )
+            for book in self._available_bookmakers
+        ]
+        dialog = MultiSelectDialog("Select bookmakers", items, self._selected_bookmakers, self)
+        if dialog.exec() == QDialog.Accepted:
+            self._selected_bookmakers = dialog.selected_keys or [book.key for book in self._available_bookmakers]
+            self._refresh_bookmaker_summary()
+
+    def _refresh_deep_market_summary(self) -> None:
+        if not self._per_sport_deep_markets:
+            self.deep_market_summary.setText("Applies to all selected sports")
+            return
+        parts: List[str] = []
+        title_map = {sport.key: sport.title for sport in self._available_sports}
+        for sport_key, markets in sorted(self._per_sport_deep_markets.items()):
+            if not markets:
+                continue
+            preview = list(dict.fromkeys(markets))
+            display = ", ".join(preview[:4])
+            if len(preview) > 4:
+                display += f" … (+{len(preview) - 4})"
+            parts.append(f"{title_map.get(sport_key, sport_key)}: {display}")
+        self.deep_market_summary.setText("; ".join(parts) if parts else "Applies to all selected sports")
 
     def _on_test_api(self) -> None:
         api_key = self.api_key_edit.text().strip()
         if not api_key:
             QMessageBox.warning(self, "Missing key", "Please enter an API key first.")
             return
+        regions = self._selected_items(self.region_box)
         try:
             client = OddsApiClient(api_key)
-            regions = self._selected_items(self.region_box)
             response = client.list_sports(regions=regions, include_all=True)
             sports: List[SportInfo] = []
             known_by_key = {sport.key: sport for sport in ALL_SPORTS}
@@ -256,8 +411,17 @@ class SettingsTab(QWidget):
             return
 
         self._client = client
-        self._sports = [sport.key for sport in sports]
-        self._populate_sport_list(sports)
+        self._available_sports = sports
+        available_sport_keys = [sport.key for sport in sports]
+        self._selected_sports = [key for key in self._selected_sports if key in available_sport_keys]
+        if not self._selected_sports:
+            self._selected_sports = list(available_sport_keys)
+        self._per_sport_deep_markets = {
+            sport_key: markets
+            for sport_key, markets in self._per_sport_deep_markets.items()
+            if sport_key in available_sport_keys
+        }
+        self._refresh_sport_summary()
 
         try:
             bookmaker_response = client.list_bookmakers(regions=regions)
@@ -291,13 +455,18 @@ class SettingsTab(QWidget):
         else:
             bookmakers = filter_bookmakers_by_regions(regions or [])
 
-        self._bookmakers = [book.key for book in bookmakers]
-        self._populate_bookmaker_list(bookmakers, select_all=True)
+        self._available_bookmakers = bookmakers
+        available_book_keys = [book.key for book in bookmakers]
+        self._selected_bookmakers = [key for key in self._selected_bookmakers if key in available_book_keys]
+        if not self._selected_bookmakers:
+            self._selected_bookmakers = list(available_book_keys)
+        self._refresh_bookmaker_summary()
+        self._refresh_deep_market_summary()
 
         QMessageBox.information(
             self,
             "Success",
-            f"API key validated. {len(self._sports)} sports available.",
+            f"API key validated. {len(self._available_sports)} sports available.",
         )
 
     def _on_apply(self) -> None:
@@ -307,9 +476,9 @@ class SettingsTab(QWidget):
             return
         client = self._client or OddsApiClient(api_key)
 
-        sports = self._selected_items(self.sports_box) or self._sports
+        sports = self._selected_sports or [sport.key for sport in self._available_sports]
         regions = self._selected_items(self.region_box) or ["us"]
-        bookmakers = self._selected_items(self.books_box) or self._bookmakers
+        bookmakers = self._selected_bookmakers or [book.key for book in self._available_bookmakers]
         markets = self._selected_items(self.markets_box) or ["h2h"]
         deep_markets = [segment.strip() for segment in self.deep_markets_edit.text().split(",") if segment.strip()]
 
@@ -324,6 +493,7 @@ class SettingsTab(QWidget):
             bookmakers=bookmakers,
             markets=markets,
             deep_markets=deep_markets,
+            deep_market_map={key: list(values) for key, values in self._per_sport_deep_markets.items()},
             window_start=window_start,
             window_end=window_end,
             min_edge=Decimal(str(self.edge_spin.value() / 100)),
@@ -354,10 +524,17 @@ class SettingsTab(QWidget):
 
         client = self._client or OddsApiClient(api_key)
         self._client = client
-        dialog = DeepMarketExplorerDialog(client, self._sports, parent=self)
+        dialog = DeepMarketExplorerDialog(
+            client,
+            self._available_sports,
+            existing=self._per_sport_deep_markets,
+            parent=self,
+        )
         if dialog.exec() == QDialog.Accepted:
-            if dialog.selected_markets:
-                self.deep_markets_edit.setText(",".join(dialog.selected_markets))
+            if dialog.global_markets:
+                self.deep_markets_edit.setText(",".join(dialog.global_markets))
+            self._per_sport_deep_markets = dialog.sport_overrides
+            self._refresh_deep_market_summary()
 
     def _on_preset_changed(self, preset: str) -> None:
         if preset == "Custom range":
@@ -377,6 +554,8 @@ class SettingsTab(QWidget):
 
 
 class ArbitrageTab(QWidget):
+    rescan_requested = Signal(str, str, str)
+
     def __init__(self, database: Database, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._db = database
@@ -388,8 +567,30 @@ class ArbitrageTab(QWidget):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Timestamp", "Event", "Market", "Edge %", "Stake plan"])
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Timestamp",
+                "Event",
+                "Market",
+                "Edge %",
+                "Total stake",
+                "Payout",
+                "Recommendations",
+                "Actions",
+            ]
+        )
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setWordWrap(True)
         layout.addWidget(self.table)
 
         self.export_button = QPushButton("Export CSV")
@@ -401,10 +602,78 @@ class ArbitrageTab(QWidget):
         self.table.setRowCount(len(records))
         for row_idx, record in enumerate(records):
             self.table.setItem(row_idx, 0, QTableWidgetItem(record.created_at.isoformat()))
-            self.table.setItem(row_idx, 1, QTableWidgetItem(record.event_id))
+            event_parts = [record.event_name]
+            if record.commence_time:
+                event_parts.append(record.commence_time.strftime("%Y-%m-%d %H:%M"))
+            if record.sport_key:
+                event_parts.append(record.sport_key)
+            self.table.setItem(row_idx, 1, QTableWidgetItem("\n".join(event_parts)))
             self.table.setItem(row_idx, 2, QTableWidgetItem(record.market_key))
             self.table.setItem(row_idx, 3, QTableWidgetItem(f"{record.edge * 100:.2f}"))
-            self.table.setItem(row_idx, 4, QTableWidgetItem(str(record.stake_plan)))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(f"${record.total_stake:.2f}"))
+            self.table.setItem(row_idx, 5, QTableWidgetItem(f"${record.payout:.2f}"))
+            recommendation_text = self._format_recommendations(record.details)
+            rec_item = QTableWidgetItem(recommendation_text)
+            rec_item.setToolTip(recommendation_text)
+            self.table.setItem(row_idx, 6, rec_item)
+            button = self._make_rescan_button(record)
+            self.table.setCellWidget(row_idx, 7, button)
+        self.table.resizeRowsToContents()
+
+    def _make_rescan_button(self, record: ArbitrageRecord) -> QPushButton:
+        button = QPushButton("Rescan")
+        if record.sport_key:
+            callback = partial(
+                self.rescan_requested.emit,
+                record.event_id,
+                record.sport_key,
+                record.market_key,
+            )
+            button.clicked.connect(callback)
+        else:
+            button.setEnabled(False)
+            button.setToolTip("Sport information unavailable for this record.")
+        return button
+
+    @staticmethod
+    def _format_recommendations(details: List[dict]) -> str:
+        if not details:
+            return ""
+        parts: List[str] = []
+        for entry in details:
+            if isinstance(entry, dict):
+                stake_raw = entry.get("stake")
+                bookmaker = entry.get("bookmaker_title") or entry.get("bookmaker_key", "?")
+                odds = entry.get("american_odds")
+                outcome = entry.get("label")
+                regions_value = entry.get("regions", [])
+                url = entry.get("url")
+            else:
+                stake_raw = getattr(entry, "stake", 0)
+                bookmaker = getattr(entry, "bookmaker_title", None) or getattr(
+                    entry, "bookmaker_key", "?"
+                )
+                odds = getattr(entry, "american_odds", None)
+                outcome = getattr(entry, "label", "")
+                regions_value = getattr(entry, "bookmaker_regions", ())
+                url = getattr(entry, "url", None)
+            try:
+                stake_value = float(stake_raw)
+            except (TypeError, ValueError):
+                stake_value = 0.0
+            if isinstance(regions_value, (list, tuple)):
+                regions = "/".join(str(region) for region in regions_value if region)
+            elif regions_value:
+                regions = str(regions_value)
+            else:
+                regions = ""
+            piece = f"Stake ${stake_value:.2f} on {outcome} @ {odds} with {bookmaker}"
+            if regions:
+                piece += f" [{regions}]"
+            if url:
+                piece += f" — {url}"
+            parts.append(piece)
+        return "\n".join(parts)
 
     def _export_csv(self) -> None:
         path = self._db.export_history_csv(Path("arb_history.csv"))
@@ -415,6 +684,7 @@ class LogsTab(QWidget):
     def __init__(self, database: Database, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._db = database
+        self._entries: List[LogRecord] = []
         self._build_ui()
         self._last_log_id = 0
         self._timer = QTimer(self)
@@ -425,22 +695,83 @@ class LogsTab(QWidget):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        layout.addWidget(self.log_view)
+        self.tabs = QTabWidget()
+
+        readable = QWidget()
+        readable_layout = QVBoxLayout(readable)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Time", "Level", "Message", "Details"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        readable_layout.addWidget(self.table)
+        self.tabs.addTab(readable, "Readable")
+
+        self.raw_view = QTextEdit()
+        self.raw_view.setReadOnly(True)
+        self.tabs.addTab(self.raw_view, "Raw feed")
+
+        layout.addWidget(self.tabs)
 
     def append_log(self, level: str, message: str) -> None:
         timestamp = datetime.utcnow().isoformat()
-        self.log_view.append(f"[{timestamp}] {level.upper()}: {message}")
+        record = LogRecord(
+            id=self._last_log_id + 1,
+            created_at=datetime.fromisoformat(timestamp),
+            level=level,
+            message=message,
+            context=None,
+        )
+        self._append_entry(record)
 
     def _poll_logs(self) -> None:
         records = self._db.fetch_logs(since_id=self._last_log_id)
         for record in records:
-            context = f" {record.context}" if record.context else ""
-            self.log_view.append(
-                f"[{record.created_at.isoformat()}] {record.level.upper()}: {record.message}{context}"
-            )
+            self._append_entry(record)
             self._last_log_id = record.id
+
+    def _append_entry(self, record: LogRecord) -> None:
+        context_text = self._format_context(record.context)
+        self.raw_view.append(
+            f"[{record.created_at.isoformat()}] {record.level.upper()}: {record.message}{(' ' + context_text) if context_text else ''}"
+        )
+        self._entries.append(record)
+        if len(self._entries) > 500:
+            self._entries = self._entries[-500:]
+        self._render_table()
+
+    def _render_table(self) -> None:
+        rows = self._entries[-500:]
+        self.table.setRowCount(len(rows))
+        for row_idx, record in enumerate(rows):
+            self.table.setItem(row_idx, 0, QTableWidgetItem(record.created_at.strftime("%Y-%m-%d %H:%M:%S")))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(record.level.upper()))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(record.message))
+            details = self._format_context(record.context)
+            details_item = QTableWidgetItem(details)
+            details_item.setToolTip(details)
+            self.table.setItem(row_idx, 3, details_item)
+        self.table.scrollToBottom()
+
+    @staticmethod
+    def _format_context(context: Optional[dict]) -> str:
+        if not context:
+            return ""
+        if isinstance(context, dict):
+            parts = []
+            for key in sorted(context.keys()):
+                value = context[key]
+                if isinstance(value, (list, dict)):
+                    parts.append(f"{key}={json.dumps(value)}")
+                else:
+                    parts.append(f"{key}={value}")
+            return ", ".join(parts)
+        return str(context)
 
 
 class DashboardTab(QWidget):
@@ -504,6 +835,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
 
         self.settings_tab.config_applied.connect(self._on_config_applied)
+        self.arbitrage_tab.rescan_requested.connect(self._handle_rescan_request)
 
         toolbar = self.addToolBar("Controls")
         self.snapshot_action = QAction("Run Snapshot", self)
@@ -552,26 +884,89 @@ class MainWindow(QMainWindow):
             self._controller.stop()
             self.dashboard_tab.update_status("Scanning stopped.")
 
+    @Slot(str, str, str)
+    def _handle_rescan_request(self, event_id: str, sport_key: str, market_key: str) -> None:
+        if not self._ensure_config():
+            return
+        assert self._controller and self._config
+        try:
+            result = self._controller.rescan_opportunity(
+                self._config, event_id, sport_key, market_key
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Rescan failed", str(exc))
+            return
+
+        details = [f"Event: {result.event_name}", f"Market: {result.market_key}"]
+        if result.commence_time:
+            details.append(result.commence_time.strftime("Commence: %Y-%m-%d %H:%M"))
+        if not result.within_window:
+            details.append("Note: event is outside the configured scan window.")
+        details.append(f"Quotes evaluated: {result.quotes_considered}")
+
+        if result.status == "event_not_found":
+            details.append("Event was not returned by the Odds API during rescan.")
+            QMessageBox.information(self, "Rescan result", "\n".join(details))
+            return
+
+        if result.opportunity:
+            edge_pct = float(result.opportunity.edge * Decimal(100))
+            details.extend(
+                [
+                    f"Edge: {edge_pct:.2f}%",
+                    f"Total stake: ${float(result.opportunity.total_stake):.2f}",
+                    f"Payout: ${float(result.opportunity.payout):.2f}",
+                ]
+            )
+            recommendation_text = ArbitrageTab._format_recommendations(
+                result.opportunity.recommendations
+            )
+            message = "\n".join(details)
+            if recommendation_text:
+                message += "\n\nRecommendations:\n" + recommendation_text
+            QMessageBox.information(self, "Opportunity confirmed", message)
+            return
+
+        status_map = {
+            "no_quotes": "No quotes were available for the selected market.",
+            "no_arbitrage": "The current odds no longer form an arbitrage opportunity.",
+        }
+        details.append(status_map.get(result.status, "No arbitrage opportunity detected."))
+        QMessageBox.information(self, "Rescan result", "\n".join(details))
+
 
 class DeepMarketExplorerDialog(QDialog):
-    def __init__(self, client: OddsApiClient, sports: List[str], parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        client: OddsApiClient,
+        sports: Sequence[SportInfo],
+        existing: Optional[Dict[str, List[str]]] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Deep Market Explorer")
         self._client = client
-        self._sports = sports
-        self.selected_markets: List[str] = []
+        self._sports = list(sports)
+        self._sport_map = {sport.key: sport for sport in self._sports}
+        self._sport_market_cache: Dict[str, List[str]] = {}
+        self.sport_overrides: Dict[str, List[str]] = {
+            key: list(values) for key, values in (existing or {}).items()
+        }
+        self.global_markets: List[str] = sorted(
+            {market for values in self.sport_overrides.values() for market in values}
+        )
         self._all_markets: List[str] = []
         self._build_ui()
         if self._sports:
-            self._load_markets_for_sport(self._sports[0])
+            self._load_markets_for_sport(self._sports[0].key)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
         self.sport_combo = QComboBox()
-        for sport_key in self._sports:
-            self.sport_combo.addItem(sport_key)
+        for sport in self._sports:
+            self.sport_combo.addItem(f"{sport.title} ({sport.key})", userData=sport.key)
         form.addRow("Sport", self.sport_combo)
 
         self.search_edit = QLineEdit()
@@ -591,39 +986,49 @@ class DeepMarketExplorerDialog(QDialog):
         self.refresh_button = QPushButton("Scan markets")
         self.select_all_button = QPushButton("Select all")
         self.clear_button = QPushButton("Clear")
-        self.apply_button = QPushButton("Apply selection")
+        self.save_button = QPushButton("Save sport selection")
+        self.done_button = QPushButton("Done")
         button_row.addWidget(self.refresh_button)
         button_row.addWidget(self.select_all_button)
         button_row.addWidget(self.clear_button)
         button_row.addStretch()
-        button_row.addWidget(self.apply_button)
+        button_row.addWidget(self.save_button)
+        button_row.addWidget(self.done_button)
         layout.addLayout(button_row)
 
         self.status_label = QLabel("Ready")
         layout.addWidget(self.status_label)
 
-        self.sport_combo.currentTextChanged.connect(self._load_markets_for_sport)
-        self.refresh_button.clicked.connect(lambda: self._load_markets_for_sport(self.sport_combo.currentText()))
+        self.sport_combo.currentTextChanged.connect(self._on_sport_changed)
+        self.refresh_button.clicked.connect(lambda: self._load_markets_for_sport(self._current_sport_key()))
         self.select_all_button.clicked.connect(self._select_all)
         self.clear_button.clicked.connect(self._clear_selection)
-        self.apply_button.clicked.connect(self._accept_selection)
+        self.save_button.clicked.connect(self._save_current_selection)
+        self.done_button.clicked.connect(self._finish)
         self.search_edit.textChanged.connect(self._filter_markets)
         self.use_all_checkbox.stateChanged.connect(self._toggle_all_state)
+
+    def _current_sport_key(self) -> str:
+        return self.sport_combo.currentData() or ""
+
+    def _on_sport_changed(self, _: str) -> None:
+        self._load_markets_for_sport(self._current_sport_key())
 
     def _load_markets_for_sport(self, sport_key: str) -> None:
         if not sport_key:
             return
         self.status_label.setText("Scanning markets…")
         QApplication.processEvents()
-        markets: List[str] = []
-        self.use_all_checkbox.setChecked(False)
-        try:
-            response = self._client.list_markets(sport_key)
-            markets = _extract_market_keys(response.data)
-        except Exception as exc:
-            self.status_label.setText(f"Falling back to catalogue ({exc})")
+        markets = self._sport_market_cache.get(sport_key, [])
         if not markets:
-            markets = get_deep_markets_for_sport(sport_key)
+            try:
+                response = self._client.list_markets(sport_key)
+                markets = _extract_market_keys(response.data)
+            except Exception as exc:
+                self.status_label.setText(f"Falling back to catalogue ({exc})")
+            if not markets:
+                markets = get_deep_markets_for_sport(sport_key)
+            self._sport_market_cache[sport_key] = list(markets)
         self.market_list.clear()
         if not markets:
             self._all_markets = []
@@ -634,8 +1039,19 @@ class DeepMarketExplorerDialog(QDialog):
             item = QListWidgetItem(market)
             item.setSelected(False)
             self.market_list.addItem(item)
+
+        saved = self.sport_overrides.get(sport_key, [])
+        if saved and set(saved) >= set(self._all_markets):
+            self.use_all_checkbox.setChecked(True)
+        else:
+            self.use_all_checkbox.setChecked(False)
+            saved_set = set(saved)
+            for index in range(self.market_list.count()):
+                item = self.market_list.item(index)
+                item.setSelected(item.text() in saved_set)
         self._filter_markets(self.search_edit.text())
-        self.status_label.setText(f"Loaded {len(self._all_markets)} markets.")
+        saved_msg = f"Saved {len(saved)}" if saved else "Unsaved"
+        self.status_label.setText(f"Loaded {len(self._all_markets)} markets. {saved_msg} selection.")
 
     def _select_all(self) -> None:
         for index in range(self.market_list.count()):
@@ -645,11 +1061,27 @@ class DeepMarketExplorerDialog(QDialog):
         self.market_list.clearSelection()
         self.use_all_checkbox.setChecked(False)
 
-    def _accept_selection(self) -> None:
+    def _save_current_selection(self, silent: bool = False) -> None:
+        sport_key = self._current_sport_key()
+        if not sport_key:
+            return
         if self.use_all_checkbox.isChecked():
-            self.selected_markets = list(self._all_markets)
+            markets = list(self._all_markets)
         else:
-            self.selected_markets = [item.text() for item in self.market_list.selectedItems()]
+            markets = [item.text() for item in self.market_list.selectedItems()]
+        markets = list(dict.fromkeys(markets))
+        if markets:
+            self.sport_overrides[sport_key] = markets
+        elif sport_key in self.sport_overrides:
+            del self.sport_overrides[sport_key]
+        if not silent:
+            self.status_label.setText(f"Saved {len(markets)} markets for {sport_key}.")
+        self.global_markets = sorted(
+            {market for values in self.sport_overrides.values() for market in values}
+        )
+
+    def _finish(self) -> None:
+        self._save_current_selection(silent=True)
         self.accept()
 
     def _filter_markets(self, text: str) -> None:

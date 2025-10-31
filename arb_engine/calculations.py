@@ -16,10 +16,28 @@ class OutcomePrice:
     """Represents the best price for a single outcome."""
 
     outcome_name: str
-    bookmaker: str
+    bookmaker_key: str
+    bookmaker_title: str
     american_odds: int
     decimal_odds: Decimal
     point: float | None = None
+    bookmaker_regions: Tuple[str, ...] = ()
+    bookmaker_url: str | None = None
+
+
+@dataclass
+class OutcomeRecommendation:
+    """Instruction for staking on a specific outcome."""
+
+    label: str
+    bookmaker_key: str
+    bookmaker_title: str
+    bookmaker_regions: Tuple[str, ...]
+    american_odds: int
+    decimal_odds: Decimal
+    stake: Decimal
+    point: float | None = None
+    url: str | None = None
 
 
 @dataclass
@@ -30,6 +48,7 @@ class ArbitrageOpportunity:
     payout: Decimal
     total_stake: Decimal
     stake_plan: Dict[str, Decimal]
+    recommendations: List[OutcomeRecommendation]
 
 
 def american_to_decimal(american: int) -> Decimal:
@@ -79,6 +98,8 @@ def detect_arbitrage(
     total_stake = Decimal(0)
     payout_candidates: List[Tuple[str, Decimal, OutcomePrice]] = []
 
+    recommendations: List[OutcomeRecommendation] = []
+
     for key, outcome in prices.items():
         raw_stake = theoretical_payout / outcome.decimal_odds
         if max_per_book is not None and raw_stake > max_per_book:
@@ -92,6 +113,19 @@ def detect_arbitrage(
         stake_plan[label] = rounded
         total_stake += rounded
         payout_candidates.append((label, rounded, outcome))
+        recommendations.append(
+            OutcomeRecommendation(
+                label=label,
+                bookmaker_key=outcome.bookmaker_key,
+                bookmaker_title=outcome.bookmaker_title,
+                bookmaker_regions=tuple(outcome.bookmaker_regions),
+                american_odds=outcome.american_odds,
+                decimal_odds=outcome.decimal_odds,
+                stake=rounded,
+                point=outcome.point,
+                url=outcome.bookmaker_url,
+            )
+        )
 
     if total_stake == 0:
         return None
@@ -109,4 +143,5 @@ def detect_arbitrage(
         payout=actual_payout,
         total_stake=total_stake,
         stake_plan=stake_plan,
+        recommendations=recommendations,
     )
