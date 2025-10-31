@@ -66,6 +66,11 @@ CREATE TABLE IF NOT EXISTS settings_profiles (
     updated_at TEXT NOT NULL,
     data TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS opportunity_totals (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    total_tested INTEGER NOT NULL
+);
 """
 
 
@@ -102,6 +107,7 @@ class ScanSummary:
     last_arbitrage_time: Optional[datetime]
     remaining_requests: Optional[int]
     reset_time: Optional[datetime]
+    opportunities_tested: int
 
 
 class Database:
@@ -111,6 +117,7 @@ class Database:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             self._ensure_arbitrage_columns(conn)
+            self._ensure_opportunity_totals(conn)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -133,6 +140,9 @@ class Database:
             conn.execute("ALTER TABLE arbitrage ADD COLUMN commence_time TEXT")
         if "details" not in existing:
             conn.execute("ALTER TABLE arbitrage ADD COLUMN details TEXT")
+
+    def _ensure_opportunity_totals(self, conn: sqlite3.Connection) -> None:
+        conn.execute("INSERT OR IGNORE INTO opportunity_totals (id, total_tested) VALUES (1, 0)")
 
     def record_event(self, event_id: str, sport_key: str, commence_time: str, data: dict) -> None:
         with self._connect() as conn:
@@ -198,6 +208,25 @@ class Database:
                 "reset_time": reset_time.isoformat() if reset_time else None,
             },
         )
+
+    def increment_opportunity_tests(self, count: int) -> None:
+        if count <= 0:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE opportunity_totals SET total_tested = total_tested + ? WHERE id = 1",
+                (int(count),),
+            )
+
+    def total_opportunity_tests(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT total_tested FROM opportunity_totals WHERE id = 1"
+            ).fetchone()
+        if not row:
+            return 0
+        value = row[0]
+        return int(value) if value is not None else 0
 
     def log(self, level: str, message: str, context: Optional[dict] = None) -> int:
         payload = None
@@ -314,6 +343,9 @@ class Database:
             latest_usage = conn.execute(
                 "SELECT remaining, reset_time FROM api_usage ORDER BY id DESC LIMIT 1"
             ).fetchone()
+            opportunity_row = conn.execute(
+                "SELECT total_tested FROM opportunity_totals WHERE id = 1"
+            ).fetchone()
 
         last_event_time = datetime.fromisoformat(last_event) if last_event else None
         last_arb_time = datetime.fromisoformat(last_arb) if last_arb else None
@@ -323,6 +355,9 @@ class Database:
             remaining_value, reset_value = latest_usage
             remaining_requests = int(remaining_value) if remaining_value is not None else None
             reset_time = datetime.fromisoformat(reset_value) if reset_value else None
+        opportunities_tested = 0
+        if opportunity_row and opportunity_row[0] is not None:
+            opportunities_tested = int(opportunity_row[0])
         return ScanSummary(
             event_count=int(event_count or 0),
             last_event_time=last_event_time,
@@ -330,6 +365,7 @@ class Database:
             last_arbitrage_time=last_arb_time,
             remaining_requests=remaining_requests,
             reset_time=reset_time,
+            opportunities_tested=opportunities_tested,
         )
 
     def list_profiles(self) -> List[str]:

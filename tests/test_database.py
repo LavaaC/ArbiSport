@@ -32,3 +32,14 @@ def test_profile_round_trip(tmp_path):
     assert restored is not None
     assert restored["regions"] == payload["regions"]
     assert restored["sports"] == payload["sports"]
+
+
+def test_opportunity_counter(tmp_path):
+    db = Database(tmp_path / "opportunities.db")
+    assert db.total_opportunity_tests() == 0
+
+    db.increment_opportunity_tests(3)
+    assert db.total_opportunity_tests() == 3
+
+    db.increment_opportunity_tests(-1)
+    assert db.total_opportunity_tests() == 3

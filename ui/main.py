@@ -897,6 +897,11 @@ class LogsTab(QWidget):
         self._timer.setInterval(3000)
         self._timer.timeout.connect(self._poll_logs)
         self._timer.start()
+        self._table_timer = QTimer(self)
+        self._table_timer.setInterval(1000)
+        self._table_timer.timeout.connect(self._render_table_if_needed)
+        self._table_timer.start()
+        self._table_dirty = False
         self._poll_logs()
 
     def _build_ui(self) -> None:
@@ -954,7 +959,9 @@ class LogsTab(QWidget):
         self._entries.append(record)
         if len(self._entries) > 500:
             self._entries = self._entries[-500:]
-        self._render_table()
+        self._table_dirty = True
+        if self.isVisible():
+            self._render_table_if_needed()
 
     def _render_table(self) -> None:
         rows = self._entries[-500:]
@@ -968,6 +975,20 @@ class LogsTab(QWidget):
             details_item.setToolTip(details)
             self.table.setItem(row_idx, 3, details_item)
         self.table.scrollToBottom()
+        self._table_dirty = False
+
+    def _render_table_if_needed(self) -> None:
+        if not self._table_dirty:
+            return
+        if not self.isVisible():
+            return
+        if self.tabs.currentWidget() is not self.tabs.widget(0):
+            return
+        self._render_table()
+
+    def showEvent(self, event) -> None:  # pragma: no cover - Qt runtime hook
+        super().showEvent(event)
+        self._render_table_if_needed()
 
     @staticmethod
     def _format_context(context: Optional[dict]) -> str:
@@ -1008,6 +1029,7 @@ class DashboardTab(QWidget):
             f"Last event time: {self._format_time(summary.last_event_time)}",
             f"Arbs found: {summary.arbitrage_count}",
             f"Last arb time: {self._format_time(summary.last_arbitrage_time)}",
+            f"Opportunities tested: {summary.opportunities_tested}",
             f"API credits remaining: {summary.remaining_requests if summary.remaining_requests is not None else '—'}",
             f"API reset time: {self._format_time(summary.reset_time)}",
         ]

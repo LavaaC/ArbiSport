@@ -167,3 +167,46 @@ def test_run_pass_filters_invalid_bookmaker(tmp_path, scan_config):
 
     remaining = controller._bookmakers_for_request(scan_config)
     assert remaining == ["book_a"]
+
+
+def test_run_pass_counts_opportunities(tmp_path, scan_config):
+    event = {
+        "id": "evt-2",
+        "commence_time": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "home_team": "Home",
+        "away_team": "Away",
+        "bookmakers": [
+            {
+                "key": "book_a",
+                "title": "Book A",
+                "markets": [
+                    {
+                        "key": "h2h",
+                        "outcomes": [
+                            {"name": "Home", "price": 110},
+                            {"name": "Away", "price": -105},
+                        ],
+                    }
+                ],
+            },
+            {
+                "key": "book_b",
+                "title": "Book B",
+                "markets": [
+                    {
+                        "key": "h2h",
+                        "outcomes": [
+                            {"name": "Away", "price": 120},
+                            {"name": "Home", "price": -110},
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+    db = Database(tmp_path / "count.db")
+    controller = ScanController(DummyClientWithEvent(event), db)
+
+    controller._run_pass(scan_config)
+
+    assert db.total_opportunity_tests() >= 1

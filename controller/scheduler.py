@@ -376,6 +376,7 @@ class ScanController:
         upcoming_within_burst = False
         total_events = 0
         total_opportunities = 0
+        total_opportunities_tested = 0
         for sport in config.sports:
             active_bookmakers = self._bookmakers_for_request(config)
             if config.bookmakers and not active_bookmakers:
@@ -445,12 +446,16 @@ class ScanController:
                 upcoming_within_burst = True
             total_opportunities += found
             total_events += events
+            total_opportunities_tested += context.get("opportunities_tested", 0)
+        if total_opportunities_tested:
+            self._db.increment_opportunity_tests(total_opportunities_tested)
         self._db.log(
             "info",
             "Scan pass completed",
             {
                 "events_considered": total_events,
                 "opportunities_found": total_opportunities,
+                "opportunities_tested": total_opportunities_tested,
                 "sports": list(config.sports),
             },
         )
@@ -475,6 +480,7 @@ class ScanController:
         skipped_no_id = 0
         quotes_collected = 0
         markets_seen = 0
+        opportunities_tested = 0
         events = response.data or []
         if isinstance(events, dict):
             events = [events]
@@ -533,6 +539,7 @@ class ScanController:
                 if len(quotes) < config.min_book_count:
                     continue
                 best_prices = select_best_prices(quotes)
+                opportunities_tested += 1
                 opportunity = detect_arbitrage(
                     prices=best_prices,
                     min_edge=config.min_edge,
@@ -561,6 +568,7 @@ class ScanController:
             "markets_evaluated": markets_seen,
             "quotes_collected": quotes_collected,
             "opportunities_found": opportunities_found,
+            "opportunities_tested": opportunities_tested,
         }
         return upcoming_within_burst, opportunities_found, events_considered, context
 
