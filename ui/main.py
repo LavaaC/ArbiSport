@@ -766,12 +766,9 @@ class LogsTab(QWidget):
             parts = []
             for key in sorted(context.keys()):
                 value = context[key]
-                if isinstance(value, (list, dict)):
-                    parts.append(f"{key}={json.dumps(value)}")
-                else:
-                    parts.append(f"{key}={value}")
+                parts.append(f"{key}={_stringify(value)}")
             return ", ".join(parts)
-        return str(context)
+        return _stringify(context)
 
 
 class DashboardTab(QWidget):
@@ -1115,6 +1112,27 @@ def _extract_market_keys(payload: object) -> List[str]:
             results.append(value)
         return results
     return []
+
+
+def _stringify(value: object) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (list, dict)):
+        try:
+            return json.dumps(value, default=_json_default)
+        except TypeError:
+            return str(value)
+    return str(value)
+
+
+def _json_default(value: object) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return str(value)
 
 
 def run_app() -> int:

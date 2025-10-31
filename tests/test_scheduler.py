@@ -15,6 +15,9 @@ class DummyClientWithEvent:
     def get_odds(self, sport_key, regions, bookmakers, markets, odds_format="american", date_format="iso"):
         return OddsResponse([self.event], None, None)
 
+    def list_markets(self, sport_key):
+        return OddsResponse([{"key": "h2h"}], None, None)
+
     def get_event_odds(
         self,
         sport_key,
@@ -30,6 +33,9 @@ class DummyClientWithEvent:
 
 class DummyClientEmpty:
     def get_odds(self, sport_key, regions, bookmakers, markets, odds_format="american", date_format="iso"):
+        return OddsResponse([], None, None)
+
+    def list_markets(self, sport_key):
         return OddsResponse([], None, None)
 
     def get_event_odds(

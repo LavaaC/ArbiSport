@@ -87,6 +87,8 @@ class ScanController:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._config: Optional[ScanConfig] = None
+        self._market_catalog: Dict[str, set[str]] = {}
+        self._invalid_deep_markets: Dict[str, set[str]] = {}
 
     def run_snapshot(self, config: ScanConfig) -> None:
         self._config = config
@@ -181,6 +183,7 @@ class ScanController:
         allowed_deep.update(config.deep_market_map.get(sport_key, []))
         if market_key not in config.markets:
             allowed_deep.add(market_key)
+        allowed_deep = set(self._filter_supported_deep_markets(sport_key, allowed_deep))
 
         market_quotes: Dict[str, List[OutcomePrice]] = {}
         quotes_collected = self._collect_market_quotes(
@@ -191,7 +194,7 @@ class ScanController:
             allowed_deep,
         )
 
-        deep_keys = list(sorted(allowed_deep))
+        deep_keys = list(sorted(self._filter_supported_deep_markets(sport_key, allowed_deep)))
         if deep_keys:
             deep_data = self._fetch_deep_markets(sport_key, event_id, config, deep_keys)
             if deep_data:
@@ -506,8 +509,27 @@ class ScanController:
 
     def _determine_deep_markets(self, sport: str, config: ScanConfig) -> List[str]:
         if sport in config.deep_market_map:
-            return config.deep_market_map[sport]
-        return config.deep_markets
+            requested = config.deep_market_map[sport]
+        else:
+            requested = config.deep_markets
+        return self._filter_supported_deep_markets(sport, requested)
+
+    def _filter_supported_deep_markets(self, sport: str, markets: Iterable[str]) -> List[str]:
+        requested = [market for market in dict.fromkeys(markets) if market]
+        if not requested:
+            return []
+
+        unavailable = self._invalid_deep_markets.get(sport, set())
+        filtered = [market for market in requested if market not in unavailable]
+        if not filtered:
+            return []
+
+        available = self._market_catalog.get(sport)
+        if available is None:
+            available = self._load_market_catalog(sport)
+        if available:
+            filtered = [market for market in filtered if market in available]
+        return filtered
 
     def _collect_market_quotes(
         self,
@@ -571,24 +593,89 @@ class ScanController:
         config: ScanConfig,
         markets: List[str],
     ) -> Optional[dict]:
+        supported = self._filter_supported_deep_markets(sport, markets)
+        if not supported:
+            return None
+
         try:
             response = self._client.get_event_odds(
                 sport_key=sport,
                 event_id=event_id,
                 regions=config.regions,
                 bookmakers=config.bookmakers,
-                markets=markets,
+                markets=supported,
             )
         except Exception as exc:
-            self._db.log("warning", "Deep market fetch failed", {"event": event_id, "error": str(exc)})
+            self._db.log(
+                "warning",
+                "Deep market fetch failed",
+                {"event": event_id, "sport": sport, "markets": supported, "error": str(exc)},
+            )
+            self._mark_deep_market_unavailable(sport, supported)
             return None
 
         self._db.log_api_usage(response.remaining_requests, response.reset_time)
+        payload: Optional[dict] = None
         if isinstance(response.data, dict):
-            return response.data
-        if isinstance(response.data, list) and response.data:
-            return response.data[0]
-        return None
+            payload = response.data
+        elif isinstance(response.data, list) and response.data:
+            entry = response.data[0]
+            if isinstance(entry, dict):
+                payload = entry
+
+        if not payload:
+            return None
+
+        returned_markets = {
+            market.get("key")
+            for bookmaker in payload.get("bookmakers", [])
+            if isinstance(bookmaker, dict)
+            for market in bookmaker.get("markets", [])
+            if isinstance(market, dict)
+        }
+        missing = [market for market in supported if market not in returned_markets]
+        if missing:
+            self._mark_deep_market_unavailable(sport, missing)
+
+        return payload
+
+    def _load_market_catalog(self, sport: str) -> set[str]:
+        try:
+            response = self._client.list_markets(sport)
+        except Exception as exc:
+            self._db.log("warning", "Market list fetch failed", {"sport": sport, "error": str(exc)})
+            markets: set[str] = set()
+        else:
+            self._db.log_api_usage(response.remaining_requests, response.reset_time)
+            markets = set(_extract_market_keys(response.data))
+        self._market_catalog[sport] = markets
+        return markets
+
+    def _mark_deep_market_unavailable(self, sport: str, markets: Iterable[str]) -> None:
+        unavailable = self._invalid_deep_markets.setdefault(sport, set())
+        for market in markets:
+            if market:
+                unavailable.add(market)
+
+
+def _extract_market_keys(payload: object) -> List[str]:
+    if isinstance(payload, list):
+        results: List[str] = []
+        for entry in payload:
+            if isinstance(entry, dict):
+                value = entry.get("key") or entry.get("name")
+                if isinstance(value, str):
+                    results.append(value)
+            elif isinstance(entry, str):
+                results.append(entry)
+        return results
+    if isinstance(payload, dict):
+        results: List[str] = []
+        value = payload.get("key") or payload.get("name")
+        if isinstance(value, str):
+            results.append(value)
+        return results
+    return []
 
 
 def _parse_time(value: Optional[str]) -> Optional[datetime]:
