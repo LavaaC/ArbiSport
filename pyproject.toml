@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arbisport"
+version = "0.1.0"
+description = "Arbitrage scanning desktop application for The Odds API"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "PySide6>=6.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0",
+    "flake8>=6.0",
+]
