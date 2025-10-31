@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -113,7 +113,9 @@ class ScanController:
                 self._stop_event.wait(timeout=sleep_for)
 
     def _run_pass(self, config: ScanConfig) -> bool:
-        now = datetime.utcnow()
+        now = _to_utc_naive(datetime.now(timezone.utc))
+        window_start = _to_utc_naive(config.window_start)
+        window_end = _to_utc_naive(config.window_end)
         burst_window = timedelta(minutes=config.schedule.burst_window_minutes)
         upcoming_within_burst = False
         total_events = 0
@@ -131,7 +133,22 @@ class ScanController:
                 continue
 
             self._db.log_api_usage(response.remaining_requests, response.reset_time)
-            burst_flag, found, events = self._process_sport_response(sport, response, config, now, burst_window)
+            (
+                burst_flag,
+                found,
+                events,
+                context,
+            ) = self._process_sport_response(
+                sport,
+                response,
+                config,
+                now,
+                window_start,
+                window_end,
+                burst_window,
+            )
+            context.update({"sport": sport})
+            self._db.log("info", "Sport processed", context)
             if burst_flag:
                 upcoming_within_burst = True
             total_opportunities += found
@@ -153,11 +170,18 @@ class ScanController:
         response: OddsResponse,
         config: ScanConfig,
         now: datetime,
+        window_start: datetime,
+        window_end: datetime,
         burst_window: timedelta,
-    ) -> Tuple[bool, int, int]:
+    ) -> Tuple[bool, int, int, Dict[str, int]]:
         upcoming_within_burst = False
         opportunities_found = 0
         events_considered = 0
+        skipped_no_time = 0
+        skipped_window = 0
+        skipped_no_id = 0
+        quotes_collected = 0
+        markets_seen = 0
         events = response.data or []
         if isinstance(events, dict):
             events = [events]
@@ -167,8 +191,11 @@ class ScanController:
                 continue
             commence_time = _parse_time(event.get("commence_time"))
             if not commence_time:
+                skipped_no_time += 1
                 continue
-            if commence_time < config.window_start or commence_time > config.window_end:
+            commence_time = _to_utc_naive(commence_time)
+            if commence_time < window_start or commence_time > window_end:
+                skipped_window += 1
                 continue
             events_considered += 1
             if commence_time - now <= burst_window:
@@ -176,19 +203,31 @@ class ScanController:
 
             event_id = event.get("id")
             if not event_id:
+                skipped_no_id += 1
                 continue
 
             self._db.record_event(event_id, sport, commence_time.isoformat(), event)
             market_quotes: Dict[str, List[OutcomePrice]] = {}
 
-            self._collect_market_quotes(event_id, event.get("bookmakers", []), market_quotes, config)
+            quotes_collected += self._collect_market_quotes(
+                event_id,
+                event.get("bookmakers", []),
+                market_quotes,
+                config,
+            )
 
             if config.deep_markets:
                 deep_data = self._fetch_deep_markets(sport, event_id, config)
                 if deep_data:
-                    self._collect_market_quotes(event_id, deep_data.get("bookmakers", []), market_quotes, config)
+                    quotes_collected += self._collect_market_quotes(
+                        event_id,
+                        deep_data.get("bookmakers", []),
+                        market_quotes,
+                        config,
+                    )
 
             for market_key, quotes in market_quotes.items():
+                markets_seen += 1
                 if len(quotes) < config.min_book_count:
                     continue
                 best_prices = select_best_prices(quotes)
@@ -202,7 +241,17 @@ class ScanController:
                 if opportunity:
                     self._handle_opportunity(event_id, market_key, opportunity)
                     opportunities_found += 1
-        return upcoming_within_burst, opportunities_found, events_considered
+        context = {
+            "events_received": len(events),
+            "events_in_window": events_considered,
+            "skipped_no_time": skipped_no_time,
+            "skipped_window": skipped_window,
+            "skipped_no_id": skipped_no_id,
+            "markets_evaluated": markets_seen,
+            "quotes_collected": quotes_collected,
+            "opportunities_found": opportunities_found,
+        }
+        return upcoming_within_burst, opportunities_found, events_considered, context
 
     def _handle_opportunity(self, event_id: str, market_key: str, opportunity: ArbitrageOpportunity) -> None:
         self._db.record_arbitrage(
@@ -229,7 +278,8 @@ class ScanController:
         bookmakers: Iterable[dict],
         market_quotes: Dict[str, List[OutcomePrice]],
         config: ScanConfig,
-    ) -> None:
+    ) -> int:
+        collected = 0
         for bookmaker in bookmakers:
             markets = bookmaker.get("markets", [])
             for market in markets:
@@ -258,12 +308,14 @@ class ScanController:
                             point=point,
                         )
                     )
+                    collected += 1
                 self._db.record_quotes(
                     event_id=event_id,
                     market_key=market_key,
                     bookmaker=bookmaker.get("key", "unknown"),
                     data=market,
                 )
+        return collected
 
     def _fetch_deep_markets(self, sport: str, event_id: str, config: ScanConfig) -> Optional[dict]:
         try:
@@ -295,3 +347,9 @@ def _parse_time(value: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _to_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)

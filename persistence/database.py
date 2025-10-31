@@ -83,6 +83,8 @@ class ScanSummary:
     last_event_time: Optional[datetime]
     arbitrage_count: int
     last_arbitrage_time: Optional[datetime]
+    remaining_requests: Optional[int]
+    reset_time: Optional[datetime]
 
 
 class Database:
@@ -149,6 +151,14 @@ class Database:
                     reset_time.isoformat() if reset_time else None,
                 ),
             )
+        self.log(
+            "info",
+            "API usage updated",
+            {
+                "remaining_requests": remaining,
+                "reset_time": reset_time.isoformat() if reset_time else None,
+            },
+        )
 
     def log(self, level: str, message: str, context: Optional[dict] = None) -> int:
         with self._connect() as conn:
@@ -216,15 +226,38 @@ class Database:
             arb_count, last_arb = conn.execute(
                 "SELECT COUNT(*), MAX(created_at) FROM arbitrage"
             ).fetchone()
+            latest_usage = conn.execute(
+                "SELECT remaining, reset_time FROM api_usage ORDER BY id DESC LIMIT 1"
+            ).fetchone()
 
         last_event_time = datetime.fromisoformat(last_event) if last_event else None
         last_arb_time = datetime.fromisoformat(last_arb) if last_arb else None
+        remaining_requests: Optional[int] = None
+        reset_time: Optional[datetime] = None
+        if latest_usage:
+            remaining_value, reset_value = latest_usage
+            remaining_requests = int(remaining_value) if remaining_value is not None else None
+            reset_time = datetime.fromisoformat(reset_value) if reset_value else None
         return ScanSummary(
             event_count=int(event_count or 0),
             last_event_time=last_event_time,
             arbitrage_count=int(arb_count or 0),
             last_arbitrage_time=last_arb_time,
+            remaining_requests=remaining_requests,
+            reset_time=reset_time,
         )
+
+    def latest_api_usage(self) -> tuple[Optional[int], Optional[datetime]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT remaining, reset_time FROM api_usage ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None, None
+        remaining, reset = row
+        remaining_value = int(remaining) if remaining is not None else None
+        reset_time = datetime.fromisoformat(reset) if reset else None
+        return remaining_value, reset_time
 
     def export_history_csv(self, output_path: str | Path) -> Path:
         output = Path(output_path)

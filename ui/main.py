@@ -12,8 +12,10 @@ from PySide6.QtCore import QDateTime, QRunnable, Qt, QThreadPool, Signal, Slot, 
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDateTimeEdit,
+    QDialog,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -42,6 +44,7 @@ from odds_client.catalog import (
     SportInfo,
     filter_bookmakers_by_regions,
 )
+from odds_client.deep_markets import get_deep_markets_for_sport
 from odds_client.client import OddsApiClient
 from persistence.database import Database
 
@@ -111,9 +114,15 @@ class SettingsTab(QWidget):
             self.markets_box.addItem(item)
         form_layout.addRow("Markets", self.markets_box)
 
+        deep_market_row = QHBoxLayout()
         self.deep_markets_edit = QLineEdit()
         self.deep_markets_edit.setPlaceholderText("Comma-separated deep markets (e.g., correct_score)")
-        form_layout.addRow("Deep markets", self.deep_markets_edit)
+        self.deep_market_browser = QPushButton("Browse…")
+        deep_market_row.addWidget(self.deep_markets_edit)
+        deep_market_row.addWidget(self.deep_market_browser)
+        deep_market_widget = QWidget()
+        deep_market_widget.setLayout(deep_market_row)
+        form_layout.addRow("Deep markets", deep_market_widget)
 
         self.window_preset_combo = QComboBox()
         self.window_preset_combo.addItems(["Custom range", *self._window_presets.keys()])
@@ -186,6 +195,7 @@ class SettingsTab(QWidget):
         self.test_button.clicked.connect(self._on_test_api)
         self.apply_button.clicked.connect(self._on_apply)
         self.window_preset_combo.currentTextChanged.connect(self._on_preset_changed)
+        self.deep_market_browser.clicked.connect(self._open_deep_market_browser)
         self._on_preset_changed(self.window_preset_combo.currentText())
 
     def _selected_items(self, widget: QListWidget) -> List[str]:
@@ -329,7 +339,25 @@ class SettingsTab(QWidget):
             ),
         )
 
+        self._client = client
         self.config_applied.emit(config, client)
+
+    def _open_deep_market_browser(self) -> None:
+        api_key = self.api_key_edit.text().strip()
+        if not api_key:
+            QMessageBox.warning(
+                self,
+                "API key required",
+                "Enter your Odds API key and test it before browsing deep markets.",
+            )
+            return
+
+        client = self._client or OddsApiClient(api_key)
+        self._client = client
+        dialog = DeepMarketExplorerDialog(client, self._sports, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            if dialog.selected_markets:
+                self.deep_markets_edit.setText(",".join(dialog.selected_markets))
 
     def _on_preset_changed(self, preset: str) -> None:
         if preset == "Custom range":
@@ -441,6 +469,8 @@ class DashboardTab(QWidget):
             f"Last event time: {self._format_time(summary.last_event_time)}",
             f"Arbs found: {summary.arbitrage_count}",
             f"Last arb time: {self._format_time(summary.last_arbitrage_time)}",
+            f"API credits remaining: {summary.remaining_requests if summary.remaining_requests is not None else '—'}",
+            f"API reset time: {self._format_time(summary.reset_time)}",
         ]
         self.status_label.setText("\n".join(parts))
 
@@ -521,6 +551,138 @@ class MainWindow(QMainWindow):
         if self._controller:
             self._controller.stop()
             self.dashboard_tab.update_status("Scanning stopped.")
+
+
+class DeepMarketExplorerDialog(QDialog):
+    def __init__(self, client: OddsApiClient, sports: List[str], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Deep Market Explorer")
+        self._client = client
+        self._sports = sports
+        self.selected_markets: List[str] = []
+        self._all_markets: List[str] = []
+        self._build_ui()
+        if self._sports:
+            self._load_markets_for_sport(self._sports[0])
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.sport_combo = QComboBox()
+        for sport_key in self._sports:
+            self.sport_combo.addItem(sport_key)
+        form.addRow("Sport", self.sport_combo)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Filter deep markets")
+        form.addRow("Filter", self.search_edit)
+
+        self.use_all_checkbox = QCheckBox("Use all deep markets")
+        form.addRow("", self.use_all_checkbox)
+
+        layout.addLayout(form)
+
+        self.market_list = QListWidget()
+        self.market_list.setSelectionMode(QListWidget.MultiSelection)
+        layout.addWidget(self.market_list)
+
+        button_row = QHBoxLayout()
+        self.refresh_button = QPushButton("Scan markets")
+        self.select_all_button = QPushButton("Select all")
+        self.clear_button = QPushButton("Clear")
+        self.apply_button = QPushButton("Apply selection")
+        button_row.addWidget(self.refresh_button)
+        button_row.addWidget(self.select_all_button)
+        button_row.addWidget(self.clear_button)
+        button_row.addStretch()
+        button_row.addWidget(self.apply_button)
+        layout.addLayout(button_row)
+
+        self.status_label = QLabel("Ready")
+        layout.addWidget(self.status_label)
+
+        self.sport_combo.currentTextChanged.connect(self._load_markets_for_sport)
+        self.refresh_button.clicked.connect(lambda: self._load_markets_for_sport(self.sport_combo.currentText()))
+        self.select_all_button.clicked.connect(self._select_all)
+        self.clear_button.clicked.connect(self._clear_selection)
+        self.apply_button.clicked.connect(self._accept_selection)
+        self.search_edit.textChanged.connect(self._filter_markets)
+        self.use_all_checkbox.stateChanged.connect(self._toggle_all_state)
+
+    def _load_markets_for_sport(self, sport_key: str) -> None:
+        if not sport_key:
+            return
+        self.status_label.setText("Scanning markets…")
+        QApplication.processEvents()
+        markets: List[str] = []
+        self.use_all_checkbox.setChecked(False)
+        try:
+            response = self._client.list_markets(sport_key)
+            markets = _extract_market_keys(response.data)
+        except Exception as exc:
+            self.status_label.setText(f"Falling back to catalogue ({exc})")
+        if not markets:
+            markets = get_deep_markets_for_sport(sport_key)
+        self.market_list.clear()
+        if not markets:
+            self._all_markets = []
+            self.status_label.setText("No deep markets available for this sport.")
+            return
+        self._all_markets = sorted(dict.fromkeys(markets))
+        for market in self._all_markets:
+            item = QListWidgetItem(market)
+            item.setSelected(False)
+            self.market_list.addItem(item)
+        self._filter_markets(self.search_edit.text())
+        self.status_label.setText(f"Loaded {len(self._all_markets)} markets.")
+
+    def _select_all(self) -> None:
+        for index in range(self.market_list.count()):
+            self.market_list.item(index).setSelected(True)
+
+    def _clear_selection(self) -> None:
+        self.market_list.clearSelection()
+        self.use_all_checkbox.setChecked(False)
+
+    def _accept_selection(self) -> None:
+        if self.use_all_checkbox.isChecked():
+            self.selected_markets = list(self._all_markets)
+        else:
+            self.selected_markets = [item.text() for item in self.market_list.selectedItems()]
+        self.accept()
+
+    def _filter_markets(self, text: str) -> None:
+        query = text.strip().casefold()
+        for index in range(self.market_list.count()):
+            item = self.market_list.item(index)
+            item.setHidden(bool(query and query not in item.text().casefold()))
+
+    def _toggle_all_state(self, state: int) -> None:
+        disabled = state == Qt.Checked
+        self.market_list.setEnabled(not disabled)
+        self.select_all_button.setEnabled(not disabled)
+        self.clear_button.setEnabled(not disabled)
+
+
+def _extract_market_keys(payload: object) -> List[str]:
+    if isinstance(payload, list):
+        results: List[str] = []
+        for entry in payload:
+            if isinstance(entry, dict):
+                value = entry.get("key") or entry.get("name")
+                if isinstance(value, str):
+                    results.append(value)
+            elif isinstance(entry, str):
+                results.append(entry)
+        return results
+    if isinstance(payload, dict):
+        results: List[str] = []
+        value = payload.get("key") or payload.get("name")
+        if isinstance(value, str):
+            results.append(value)
+        return results
+    return []
 
 
 def run_app() -> int:

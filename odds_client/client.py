@@ -118,6 +118,12 @@ class OddsApiClient:
 
         return self._get(f"/sports/{sport_key}/events/{event_id}/odds", params)
 
+    def list_markets(self, sport_key: str) -> OddsResponse:
+        """Retrieve available market keys for a sport."""
+
+        params: MutableMapping[str, str] = {"apiKey": self._api_key}
+        return self._get(f"/sports/{sport_key}/markets", params)
+
     def _get(self, path: str, params: Mapping[str, str]) -> OddsResponse:
         url = f"{self.BASE_URL}{path}"
         response = self._session.get(url, params=params, timeout=15)
