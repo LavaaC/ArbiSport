@@ -38,7 +38,11 @@ class OddsApiClient:
         self._api_key = api_key
         self._session = session or requests.Session()
 
-    def list_sports(self, regions: Optional[Iterable[str]] = None) -> OddsResponse:
+    def list_sports(
+        self,
+        regions: Optional[Iterable[str]] = None,
+        include_all: bool = False,
+    ) -> OddsResponse:
         """Return the list of supported sports.
 
         Parameters mirror https://the-odds-api.com/ documentation.
@@ -47,8 +51,21 @@ class OddsApiClient:
         params: MutableMapping[str, str] = {"apiKey": self._api_key}
         if regions:
             params["regions"] = ",".join(sorted(regions))
+        if include_all:
+            params["all"] = "true"
 
         return self._get("/sports", params)
+
+    def list_bookmakers(
+        self, regions: Optional[Iterable[str]] = None
+    ) -> OddsResponse:
+        """Return the list of bookmakers supported by the Odds API."""
+
+        params: MutableMapping[str, str] = {"apiKey": self._api_key}
+        if regions:
+            params["regions"] = ",".join(sorted(regions))
+
+        return self._get("/bookmakers", params)
 
     def get_odds(
         self,

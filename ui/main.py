@@ -35,6 +35,13 @@ from PySide6.QtWidgets import (
 )
 from controller.scheduler import ScanConfig, ScanController, ScanMode, ScanSchedule
 from normalize.names import NameNormalizer
+from odds_client.catalog import (
+    ALL_BOOKMAKERS,
+    ALL_SPORTS,
+    BookmakerInfo,
+    SportInfo,
+    filter_bookmakers_by_regions,
+)
 from odds_client.client import OddsApiClient
 from persistence.database import Database
 
@@ -57,8 +64,8 @@ class SettingsTab(QWidget):
         self._db = database
         self._thread_pool = QThreadPool.globalInstance()
         self._client: Optional[OddsApiClient] = None
-        self._sports: List[str] = []
-        self._bookmakers: List[str] = []
+        self._sports: List[str] = [sport.key for sport in ALL_SPORTS]
+        self._bookmakers: List[str] = [book.key for book in ALL_BOOKMAKERS]
         self._markets = ["h2h", "spreads", "totals"]
         self._regions = ["us", "uk", "eu", "au"]
         self._window_presets = {
@@ -88,10 +95,12 @@ class SettingsTab(QWidget):
 
         self.sports_box = QListWidget()
         self.sports_box.setSelectionMode(QListWidget.MultiSelection)
+        self._populate_sport_list(ALL_SPORTS)
         form_layout.addRow("Sports", self.sports_box)
 
         self.books_box = QListWidget()
         self.books_box.setSelectionMode(QListWidget.MultiSelection)
+        self._populate_bookmaker_list(ALL_BOOKMAKERS, select_all=True)
         form_layout.addRow("Bookmakers", self.books_box)
 
         self.markets_box = QListWidget()
@@ -180,7 +189,28 @@ class SettingsTab(QWidget):
         self._on_preset_changed(self.window_preset_combo.currentText())
 
     def _selected_items(self, widget: QListWidget) -> List[str]:
-        return [item.text() for item in widget.selectedItems()]
+        selections: List[str] = []
+        for item in widget.selectedItems():
+            key = item.data(Qt.UserRole)
+            selections.append(key if key else item.text())
+        return selections
+
+    def _populate_sport_list(self, sports: List[SportInfo]) -> None:
+        self.sports_box.clear()
+        for sport in sports:
+            item = QListWidgetItem(f"{sport.key} — {sport.title}")
+            item.setData(Qt.UserRole, sport.key)
+            self.sports_box.addItem(item)
+
+    def _populate_bookmaker_list(
+        self, bookmakers: List[BookmakerInfo], *, select_all: bool = False
+    ) -> None:
+        self.books_box.clear()
+        for bookmaker in bookmakers:
+            item = QListWidgetItem(f"{bookmaker.key} — {bookmaker.title}")
+            item.setData(Qt.UserRole, bookmaker.key)
+            item.setSelected(select_all)
+            self.books_box.addItem(item)
 
     def _on_test_api(self) -> None:
         api_key = self.api_key_edit.text().strip()
@@ -190,44 +220,75 @@ class SettingsTab(QWidget):
         try:
             client = OddsApiClient(api_key)
             regions = self._selected_items(self.region_box)
-            response = client.list_sports(regions=regions)
-            sports = [sport.get("key") for sport in response.data if sport.get("key")]
+            response = client.list_sports(regions=regions, include_all=True)
+            sports: List[SportInfo] = []
+            known_by_key = {sport.key: sport for sport in ALL_SPORTS}
+            for entry in response.data or []:
+                key = entry.get("key") if isinstance(entry, dict) else None
+                if not key:
+                    continue
+                if key in known_by_key:
+                    sports.append(known_by_key[key])
+                    continue
+                title = entry.get("title") if isinstance(entry, dict) else None
+                group = entry.get("group") if isinstance(entry, dict) else None
+                sports.append(
+                    SportInfo(
+                        key=key,
+                        title=title or key,
+                        group=group or "Other",
+                    )
+                )
+            if not sports:
+                sports = ALL_SPORTS
         except Exception as exc:
             QMessageBox.critical(self, "API error", f"Failed to validate key: {exc}")
             return
 
         self._client = client
-        self._sports = sports
-        self.sports_box.clear()
-        for sport in sports:
-            item = QListWidgetItem(sport)
-            self.sports_box.addItem(item)
+        self._sports = [sport.key for sport in sports]
+        self._populate_sport_list(sports)
 
-        bookmakers = set()
-        for sample_sport in sports[:3]:
-            try:
-                odds_response = client.get_odds(
-                    sport_key=sample_sport,
-                    regions=regions or ["us"],
-                    bookmakers=[],
-                    markets=["h2h"],
+        try:
+            bookmaker_response = client.list_bookmakers(regions=regions)
+            bookmaker_keys: List[BookmakerInfo] = []
+            known_books = {book.key: book for book in ALL_BOOKMAKERS}
+            for entry in bookmaker_response.data or []:
+                if not isinstance(entry, dict):
+                    continue
+                key = entry.get("key")
+                if not key:
+                    continue
+                if key in known_books:
+                    bookmaker_keys.append(known_books[key])
+                    continue
+                title = entry.get("title") or key
+                regions_meta = entry.get("regions")
+                if isinstance(regions_meta, str):
+                    regions_tuple = tuple(part.strip().lower() for part in regions_meta.split(",") if part.strip())
+                elif isinstance(regions_meta, list):
+                    regions_tuple = tuple(str(part).lower() for part in regions_meta if str(part))
+                else:
+                    regions_tuple = tuple()
+                bookmaker_keys.append(
+                    BookmakerInfo(key=key, title=title, regions=regions_tuple or ("global",))
                 )
-            except Exception:
-                continue
-            for event in odds_response.data:
-                for bookmaker in event.get("bookmakers", []):
-                    if bookmaker.get("key"):
-                        bookmakers.add(bookmaker["key"])
-            if bookmakers:
-                break
+        except Exception:
+            bookmaker_keys = []
 
-        self.books_box.clear()
-        for book in sorted(bookmakers):
-            item = QListWidgetItem(book)
-            item.setSelected(True)
-            self.books_box.addItem(item)
+        if bookmaker_keys:
+            bookmakers = bookmaker_keys
+        else:
+            bookmakers = filter_bookmakers_by_regions(regions or [])
 
-        QMessageBox.information(self, "Success", f"API key validated. {len(sports)} sports available.")
+        self._bookmakers = [book.key for book in bookmakers]
+        self._populate_bookmaker_list(bookmakers, select_all=True)
+
+        QMessageBox.information(
+            self,
+            "Success",
+            f"API key validated. {len(self._sports)} sports available.",
+        )
 
     def _on_apply(self) -> None:
         api_key = self.api_key_edit.text().strip()
@@ -238,7 +299,7 @@ class SettingsTab(QWidget):
 
         sports = self._selected_items(self.sports_box) or self._sports
         regions = self._selected_items(self.region_box) or ["us"]
-        bookmakers = self._selected_items(self.books_box)
+        bookmakers = self._selected_items(self.books_box) or self._bookmakers
         markets = self._selected_items(self.markets_box) or ["h2h"]
         deep_markets = [segment.strip() for segment in self.deep_markets_edit.text().split(",") if segment.strip()]
 
