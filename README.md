@@ -66,5 +66,6 @@ If you previously cloned the project and want the latest updates:
   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
   ```
 - **`ModuleNotFoundError: No module named 'PySide6'`.** Ensure `python -m pip install --user -e .` completed successfully; rerun the command if necessary.
+- **Editable install reports “Multiple top-level packages discovered”.** Confirm your `pyproject.toml` contains the `[tool.setuptools]` section listing `arb_engine`, `controller`, `normalize`, `odds_client`, `persistence`, and `ui`. If the block is missing (for example after resolving a merge), restore it with `git checkout -- pyproject.toml` or merge the latest `main`. Also make sure your setuptools version is 61 or newer: `python -c "import setuptools; print(setuptools.__version__)"`.
 
 With these steps you can install, update, and operate the ArbiSport scanner entirely from your Windows 11 machine.
