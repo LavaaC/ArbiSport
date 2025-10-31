@@ -18,12 +18,4 @@ dev = [
     "flake8>=6.0",
 ]
 
-[tool.setuptools]
-packages = [
-    "arb_engine",
-    "controller",
-    "normalize",
-    "odds_client",
-    "persistence",
-    "ui",
-]
+
