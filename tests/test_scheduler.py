@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 
 from controller.scheduler import ScanConfig, ScanController, ScanMode, ScanSchedule
-from odds_client.client import OddsResponse
+from odds_client.client import OddsApiError, OddsResponse
 from persistence.database import Database
 
 
@@ -33,6 +33,35 @@ class DummyClientWithEvent:
 
 class DummyClientEmpty:
     def get_odds(self, sport_key, regions, bookmakers, markets, odds_format="american", date_format="iso"):
+        return OddsResponse([], None, None)
+
+    def list_markets(self, sport_key):
+        return OddsResponse([], None, None)
+
+    def get_event_odds(
+        self,
+        sport_key,
+        event_id,
+        regions,
+        bookmakers,
+        markets,
+        odds_format="american",
+        date_format="iso",
+    ):
+        return OddsResponse({}, None, None)
+
+
+class DummyClientInvalidThenEmpty:
+    def __init__(self, invalid_key: str):
+        self.invalid_key = invalid_key
+        self.calls = 0
+
+    def get_odds(self, sport_key, regions, bookmakers, markets, odds_format="american", date_format="iso"):
+        self.calls += 1
+        if self.calls == 1:
+            raise OddsApiError(
+                f"Odds API request failed with status 400: {{\"msg\": \"Invalid sportsbook '{self.invalid_key}'\"}}"
+            )
         return OddsResponse([], None, None)
 
     def list_markets(self, sport_key):
@@ -128,3 +157,13 @@ def test_rescan_handles_missing_event(tmp_path, scan_config):
     assert result.status == "event_not_found"
     assert result.opportunity is None
     assert result.quotes_considered == 0
+
+
+def test_run_pass_filters_invalid_bookmaker(tmp_path, scan_config):
+    db = Database(tmp_path / "test-invalid.db")
+    controller = ScanController(DummyClientInvalidThenEmpty("book_b"), db)
+
+    controller._run_pass(scan_config)
+
+    remaining = controller._bookmakers_for_request(scan_config)
+    assert remaining == ["book_a"]

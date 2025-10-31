@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
+import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -22,7 +24,7 @@ from odds_client.catalog import get_bookmaker_info
 from persistence.database import Database
 
 try:
-    from odds_client.client import OddsApiClient, OddsResponse
+    from odds_client.client import OddsApiClient, OddsApiError, OddsResponse
 except Exception as exc:  # pragma: no cover - defensive import guard
     raise RuntimeError("Failed to import OddsApiClient") from exc
 
@@ -89,6 +91,7 @@ class ScanController:
         self._config: Optional[ScanConfig] = None
         self._market_catalog: Dict[str, set[str]] = {}
         self._invalid_deep_markets: Dict[str, set[str]] = {}
+        self._invalid_bookmakers: set[str] = set()
 
     def run_snapshot(self, config: ScanConfig) -> None:
         self._config = config
@@ -111,6 +114,13 @@ class ScanController:
         self._thread = None
         self._db.log("info", "Scanning stopped")
 
+    def reset_runtime_state(self) -> None:
+        """Clear transient caches maintained by the controller."""
+
+        self._market_catalog.clear()
+        self._invalid_deep_markets.clear()
+        self._invalid_bookmakers.clear()
+
     def rescan_opportunity(
         self,
         config: ScanConfig,
@@ -122,13 +132,64 @@ class ScanController:
 
         window_start = _to_utc_naive(config.window_start)
         window_end = _to_utc_naive(config.window_end)
+        active_bookmakers = self._bookmakers_for_request(config)
+        if config.bookmakers and not active_bookmakers:
+            self._db.log(
+                "warning",
+                "All configured bookmakers rejected",
+                {"sport": sport_key, "bookmakers": list(config.bookmakers)},
+            )
+            return RescanResult(
+                event_id=event_id,
+                sport_key=sport_key,
+                market_key=market_key,
+                event_name=event_id,
+                commence_time=None,
+                within_window=False,
+                quotes_considered=0,
+                opportunity=None,
+                status="no_bookmakers",
+            )
         try:
             response = self._client.get_odds(
                 sport_key=sport_key,
                 regions=config.regions,
-                bookmakers=config.bookmakers,
+                bookmakers=active_bookmakers,
                 markets=config.markets,
             )
+        except OddsApiError as exc:
+            if self._handle_bookmaker_error(exc, active_bookmakers):
+                active_bookmakers = self._bookmakers_for_request(config)
+                if config.bookmakers and not active_bookmakers:
+                    self._db.log(
+                        "warning",
+                        "All configured bookmakers rejected",
+                        {"sport": sport_key, "bookmakers": list(config.bookmakers)},
+                    )
+                    return RescanResult(
+                        event_id=event_id,
+                        sport_key=sport_key,
+                        market_key=market_key,
+                        event_name=event_id,
+                        commence_time=None,
+                        within_window=False,
+                        quotes_considered=0,
+                        opportunity=None,
+                        status="no_bookmakers",
+                    )
+                response = self._client.get_odds(
+                    sport_key=sport_key,
+                    regions=config.regions,
+                    bookmakers=active_bookmakers,
+                    markets=config.markets,
+                )
+            else:
+                self._db.log(
+                    "error",
+                    "Rescan odds fetch failed",
+                    {"event_id": event_id, "sport": sport_key, "error": str(exc)},
+                )
+                raise
         except Exception as exc:
             self._db.log(
                 "error",
@@ -196,7 +257,9 @@ class ScanController:
 
         deep_keys = list(sorted(self._filter_supported_deep_markets(sport_key, allowed_deep)))
         if deep_keys:
-            deep_data = self._fetch_deep_markets(sport_key, event_id, config, deep_keys)
+            deep_data = self._fetch_deep_markets(
+                sport_key, event_id, config, deep_keys, active_bookmakers
+            )
             if deep_data:
                 quotes_collected += self._collect_market_quotes(
                     event_id,
@@ -314,13 +377,48 @@ class ScanController:
         total_events = 0
         total_opportunities = 0
         for sport in config.sports:
+            active_bookmakers = self._bookmakers_for_request(config)
+            if config.bookmakers and not active_bookmakers:
+                self._db.log(
+                    "warning",
+                    "All configured bookmakers rejected",
+                    {"sport": sport, "bookmakers": list(config.bookmakers)},
+                )
+                continue
             try:
                 response = self._client.get_odds(
                     sport_key=sport,
                     regions=config.regions,
-                    bookmakers=config.bookmakers,
+                    bookmakers=active_bookmakers,
                     markets=config.markets,
                 )
+            except OddsApiError as exc:
+                if self._handle_bookmaker_error(exc, active_bookmakers):
+                    active_bookmakers = self._bookmakers_for_request(config)
+                    if config.bookmakers and not active_bookmakers:
+                        self._db.log(
+                            "warning",
+                            "All configured bookmakers rejected",
+                            {"sport": sport, "bookmakers": list(config.bookmakers)},
+                        )
+                        continue
+                    try:
+                        response = self._client.get_odds(
+                            sport_key=sport,
+                            regions=config.regions,
+                            bookmakers=active_bookmakers,
+                            markets=config.markets,
+                        )
+                    except Exception as retry_exc:
+                        self._db.log(
+                            "error",
+                            "Odds fetch failed",
+                            {"sport": sport, "error": str(retry_exc)},
+                        )
+                        continue
+                else:
+                    self._db.log("error", "Odds fetch failed", {"sport": sport, "error": str(exc)})
+                    continue
             except Exception as exc:
                 self._db.log("error", "Odds fetch failed", {"sport": sport, "error": str(exc)})
                 continue
@@ -339,6 +437,7 @@ class ScanController:
                 window_start,
                 window_end,
                 burst_window,
+                active_bookmakers,
             )
             context.update({"sport": sport})
             self._db.log("info", "Sport processed", context)
@@ -366,6 +465,7 @@ class ScanController:
         window_start: datetime,
         window_end: datetime,
         burst_window: timedelta,
+        bookmakers: Iterable[str],
     ) -> Tuple[bool, int, int, Dict[str, int]]:
         upcoming_within_burst = False
         opportunities_found = 0
@@ -416,7 +516,9 @@ class ScanController:
             deep_market_keys = self._determine_deep_markets(sport, config)
             deep_data: Optional[dict] = None
             if deep_market_keys:
-                deep_data = self._fetch_deep_markets(sport, event_id, config, deep_market_keys)
+                deep_data = self._fetch_deep_markets(
+                    sport, event_id, config, deep_market_keys, bookmakers
+                )
             if deep_data:
                 quotes_collected += self._collect_market_quotes(
                     event_id,
@@ -514,6 +616,30 @@ class ScanController:
             requested = config.deep_markets
         return self._filter_supported_deep_markets(sport, requested)
 
+    def _bookmakers_for_request(self, config: ScanConfig) -> List[str]:
+        unique = list(dict.fromkeys(config.bookmakers))
+        if not unique:
+            return []
+        filtered = [book for book in unique if book not in self._invalid_bookmakers]
+        return filtered if filtered else unique
+
+    def _handle_bookmaker_error(self, exc: Exception, attempted: Iterable[str]) -> bool:
+        message = str(exc)
+        if "invalid" not in message.lower():
+            return False
+        attempted_list = list(dict.fromkeys(attempted))
+        invalid = _extract_invalid_bookmakers(message, attempted_list)
+        if not invalid:
+            return False
+        for book in invalid:
+            self._invalid_bookmakers.add(book)
+        self._db.log(
+            "warning",
+            "Bookmaker disabled after API rejection",
+            {"invalid_bookmakers": invalid},
+        )
+        return True
+
     def _filter_supported_deep_markets(self, sport: str, markets: Iterable[str]) -> List[str]:
         requested = [market for market in dict.fromkeys(markets) if market]
         if not requested:
@@ -592,7 +718,9 @@ class ScanController:
         event_id: str,
         config: ScanConfig,
         markets: List[str],
+        bookmakers: Iterable[str],
     ) -> Optional[dict]:
+        bookmaker_list = list(bookmakers)
         supported = self._filter_supported_deep_markets(sport, markets)
         if not supported:
             return None
@@ -602,9 +730,49 @@ class ScanController:
                 sport_key=sport,
                 event_id=event_id,
                 regions=config.regions,
-                bookmakers=config.bookmakers,
+                bookmakers=bookmaker_list,
                 markets=supported,
             )
+        except OddsApiError as exc:
+            if self._handle_bookmaker_error(exc, bookmaker_list):
+                filtered = self._bookmakers_for_request(config)
+                if config.bookmakers and not filtered:
+                    self._db.log(
+                        "warning",
+                        "All configured bookmakers rejected",
+                        {"sport": sport, "bookmakers": list(config.bookmakers)},
+                    )
+                    return None
+                try:
+                    response = self._client.get_event_odds(
+                        sport_key=sport,
+                        event_id=event_id,
+                        regions=config.regions,
+                        bookmakers=filtered,
+                        markets=supported,
+                    )
+                except Exception as retry_exc:
+                    self._db.log(
+                        "warning",
+                        "Deep market fetch failed",
+                        {
+                            "event": event_id,
+                            "sport": sport,
+                            "markets": supported,
+                            "error": str(retry_exc),
+                        },
+                    )
+                    self._mark_deep_market_unavailable(sport, supported)
+                    return None
+                bookmaker_list = filtered
+            else:
+                self._db.log(
+                    "warning",
+                    "Deep market fetch failed",
+                    {"event": event_id, "sport": sport, "markets": supported, "error": str(exc)},
+                )
+                self._mark_deep_market_unavailable(sport, supported)
+                return None
         except Exception as exc:
             self._db.log(
                 "warning",
@@ -676,6 +844,49 @@ def _extract_market_keys(payload: object) -> List[str]:
             results.append(value)
         return results
     return []
+
+
+def _extract_invalid_bookmakers(message: str, attempted: Iterable[str]) -> List[str]:
+    attempted_list = list(dict.fromkeys(attempted))
+    if not attempted_list:
+        return []
+    attempted_map = {key.lower(): key for key in attempted_list}
+    payload = _extract_json_payload(message)
+    search_sources: List[str] = []
+    if payload:
+        for value in payload.values():
+            if isinstance(value, str):
+                search_sources.append(value)
+            elif isinstance(value, list):
+                search_sources.extend(str(item) for item in value)
+    search_sources.append(message)
+    pattern = re.compile(r"['\"]?([A-Za-z0-9_]+)['\"]?")
+    found: set[str] = set()
+    for source in search_sources:
+        if not isinstance(source, str):
+            continue
+        for match in pattern.findall(source):
+            lower = match.lower()
+            if lower in attempted_map:
+                found.add(attempted_map[lower])
+    ordered: List[str] = []
+    for key in attempted_list:
+        if key in found:
+            ordered.append(key)
+    return ordered
+
+
+def _extract_json_payload(message: str) -> Optional[dict]:
+    start = message.find("{")
+    end = message.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    snippet = message[start : end + 1]
+    try:
+        data = json.loads(snippet)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _parse_time(value: Optional[str]) -> Optional[datetime]:

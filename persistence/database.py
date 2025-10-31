@@ -8,6 +8,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
@@ -58,11 +59,19 @@ CREATE TABLE IF NOT EXISTS logs (
     message TEXT NOT NULL,
     context TEXT
 );
+
+CREATE TABLE IF NOT EXISTS settings_profiles (
+    name TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    data TEXT NOT NULL
+);
 """
 
 
 @dataclass
 class ArbitrageRecord:
+    id: int
     created_at: datetime
     event_id: str
     event_name: str
@@ -191,6 +200,9 @@ class Database:
         )
 
     def log(self, level: str, message: str, context: Optional[dict] = None) -> int:
+        payload = None
+        if context:
+            payload = _encode_context(context)
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO logs (created_at, level, message, context) VALUES (?, ?, ?, ?)",
@@ -198,7 +210,7 @@ class Database:
                     datetime.utcnow().isoformat(),
                     level,
                     message,
-                    json.dumps(context) if context else None,
+                    payload,
                 ),
             )
             return int(cur.lastrowid)
@@ -206,23 +218,24 @@ class Database:
     def history(self, limit: int = 100) -> Iterable[ArbitrageRecord]:
         with self._connect() as conn:
             cur = conn.execute(
-                "SELECT created_at, event_id, event_name, sport_key, commence_time, market_key, edge, total_stake, payout, stake_plan, details"
+                "SELECT id, created_at, event_id, event_name, sport_key, commence_time, market_key, edge, total_stake, payout, stake_plan, details"
                 " FROM arbitrage ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             )
             for row in cur.fetchall():
-                created_at = datetime.fromisoformat(row[0])
-                event_id = row[1]
-                event_name = row[2]
-                sport_key = row[3]
-                commence_raw = row[4]
+                record_id = int(row[0])
+                created_at = datetime.fromisoformat(row[1])
+                event_id = row[2]
+                event_name = row[3]
+                sport_key = row[4]
+                commence_raw = row[5]
                 commence_time = datetime.fromisoformat(commence_raw) if commence_raw else None
-                market_key = row[5]
-                edge = row[6]
-                total_stake = row[7]
-                payout = row[8]
-                stake_plan_json = row[9]
-                details_json = row[10]
+                market_key = row[6]
+                edge = row[7]
+                total_stake = row[8]
+                payout = row[9]
+                stake_plan_json = row[10]
+                details_json = row[11]
                 if not event_name or commence_time is None:
                     fallback = conn.execute(
                         "SELECT data FROM events WHERE id = ?",
@@ -233,6 +246,7 @@ class Database:
                         event_name = event_name or _derive_event_title(payload)
                         commence_time = commence_time or _derive_commence_time(payload)
                 yield ArbitrageRecord(
+                    id=record_id,
                     created_at=created_at,
                     event_id=event_id,
                     event_name=event_name or event_id,
@@ -245,6 +259,17 @@ class Database:
                     stake_plan=json.loads(stake_plan_json),
                     details=json.loads(details_json) if details_json else [],
                 )
+
+    def delete_arbitrage(self, record_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM arbitrage WHERE id = ?", (record_id,))
+        self.log("info", "Arbitrage record deleted", {"arbitrage_id": record_id})
+
+    def clear_event_cache(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM quotes")
+            conn.execute("DELETE FROM events")
+        self.log("info", "Event cache cleared")
 
     def fetch_logs(self, since_id: Optional[int] = None, limit: int = 200) -> List[LogRecord]:
         query = "SELECT id, created_at, level, message, context FROM logs"
@@ -260,7 +285,13 @@ class Database:
             cur = conn.execute(query, params)
             records: List[LogRecord] = []
             for log_id, created_at, level, message, context in cur.fetchall():
-                parsed_context = json.loads(context) if context else None
+                if context:
+                    try:
+                        parsed_context = json.loads(context)
+                    except json.JSONDecodeError:
+                        parsed_context = {"raw": context}
+                else:
+                    parsed_context = None
                 records.append(
                     LogRecord(
                         id=int(log_id),
@@ -300,6 +331,48 @@ class Database:
             remaining_requests=remaining_requests,
             reset_time=reset_time,
         )
+
+    def list_profiles(self) -> List[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT name FROM settings_profiles ORDER BY LOWER(name)"
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def get_profile(self, name: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT data FROM settings_profiles WHERE name = ?",
+                (name,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except json.JSONDecodeError:
+            return None
+
+    def save_profile(self, name: str, data: dict) -> None:
+        payload = _encode_context(data)
+        timestamp = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "REPLACE INTO settings_profiles (name, created_at, updated_at, data) VALUES (?, COALESCE((SELECT created_at FRO"
+                "M settings_profiles WHERE name = ?), ?), ?, ?)",
+                (
+                    name,
+                    name,
+                    timestamp,
+                    timestamp,
+                    payload,
+                ),
+            )
+        self.log("info", "Preset saved", {"name": name})
+
+    def delete_profile(self, name: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM settings_profiles WHERE name = ?", (name,))
+        self.log("info", "Preset deleted", {"name": name})
 
     def latest_api_usage(self) -> tuple[Optional[int], Optional[datetime]]:
         with self._connect() as conn:
@@ -377,3 +450,21 @@ def _derive_commence_time(payload: dict) -> Optional[datetime]:
         return datetime.fromisoformat(commence_value)
     except ValueError:
         return None
+
+
+def _encode_context(context: dict) -> str:
+    def normalize(value: object) -> object:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, dict):
+            return {str(key): normalize(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    try:
+        return json.dumps(normalize(context))
+    except TypeError:
+        return json.dumps({"raw": str(context)})

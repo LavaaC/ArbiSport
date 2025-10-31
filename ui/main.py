@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QInputDialog,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -141,6 +142,7 @@ class MultiSelectDialog(QDialog):
 
 class SettingsTab(QWidget):
     config_applied = Signal(ScanConfig, OddsApiClient)
+    clear_cache_requested = Signal()
 
     def __init__(self, database: Database, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -163,6 +165,19 @@ class SettingsTab(QWidget):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+
+        profile_group = QGroupBox("Saved presets")
+        profile_layout = QHBoxLayout(profile_group)
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(200)
+        self.profile_combo.addItem("Select preset…", userData=None)
+        self.load_profile_button = QPushButton("Load")
+        self.save_profile_button = QPushButton("Save current…")
+        self.delete_profile_button = QPushButton("Delete")
+        profile_layout.addWidget(self.profile_combo, 1)
+        profile_layout.addWidget(self.load_profile_button)
+        profile_layout.addWidget(self.save_profile_button)
+        profile_layout.addWidget(self.delete_profile_button)
 
         form_group = QGroupBox("API Settings")
         form_layout = QFormLayout(form_group)
@@ -282,17 +297,27 @@ class SettingsTab(QWidget):
 
         self.test_button = QPushButton("Test API")
         self.apply_button = QPushButton("Save & Apply")
+        self.clear_cache_button = QPushButton("Clear cached events")
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.test_button)
         button_layout.addWidget(self.apply_button)
 
+        layout.addWidget(profile_group)
         layout.addWidget(form_group)
         layout.addLayout(button_layout)
+        layout.addWidget(self.clear_cache_button, alignment=Qt.AlignLeft)
         layout.addStretch()
+
+        self.profile_combo.currentIndexChanged.connect(self._update_profile_buttons)
+        self.load_profile_button.clicked.connect(self._load_selected_profile)
+        self.save_profile_button.clicked.connect(self._prompt_save_profile)
+        self.delete_profile_button.clicked.connect(self._delete_selected_profile)
+        self._update_profile_buttons()
 
         self.test_button.clicked.connect(self._on_test_api)
         self.apply_button.clicked.connect(self._on_apply)
+        self.clear_cache_button.clicked.connect(self._on_clear_cache)
         self.window_preset_combo.currentTextChanged.connect(self._on_preset_changed)
         self.deep_market_browser.clicked.connect(self._open_deep_market_browser)
         self.sports_browse_button.clicked.connect(self._open_sport_browser)
@@ -301,6 +326,16 @@ class SettingsTab(QWidget):
         self._refresh_sport_summary()
         self._refresh_bookmaker_summary()
         self._refresh_deep_market_summary()
+        self._reload_profiles()
+
+    def _on_clear_cache(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Clear cached events",
+            "Remove all stored events and quotes? This will not delete arbitrage history.",
+        )
+        if reply == QMessageBox.Yes:
+            self.clear_cache_requested.emit()
 
     def _selected_items(self, widget: QListWidget) -> List[str]:
         selections: List[str] = []
@@ -482,8 +517,8 @@ class SettingsTab(QWidget):
         markets = self._selected_items(self.markets_box) or ["h2h"]
         deep_markets = [segment.strip() for segment in self.deep_markets_edit.text().split(",") if segment.strip()]
 
-        window_start = self.window_start.dateTime().toPython()
-        window_end = self.window_end.dateTime().toPython()
+        window_start = self._as_utc_datetime(self.window_start)
+        window_end = self._as_utc_datetime(self.window_end)
         max_per_book_value = Decimal(str(self.max_per_book_spin.value()))
         max_per_book = None if self.max_per_book_spin.value() == 0.0 else max_per_book_value
 
@@ -512,6 +547,96 @@ class SettingsTab(QWidget):
         self._client = client
         self.config_applied.emit(config, client)
 
+    def _as_utc_datetime(self, widget: QDateTimeEdit) -> datetime:
+        dt = widget.dateTime().toUTC().toPython()
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _collect_profile_payload(self) -> dict:
+        window_start = self._as_utc_datetime(self.window_start)
+        window_end = self._as_utc_datetime(self.window_end)
+        return {
+            "api_key": self.api_key_edit.text(),
+            "regions": self._selected_items(self.region_box) or ["us"],
+            "sports": list(self._selected_sports),
+            "bookmakers": list(self._selected_bookmakers),
+            "markets": self._selected_items(self.markets_box) or ["h2h"],
+            "deep_markets": self.deep_markets_edit.text(),
+            "per_sport_deep_markets": {
+                key: list(values) for key, values in self._per_sport_deep_markets.items()
+            },
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "window_preset": self.window_preset_combo.currentText(),
+            "min_edge": self.edge_spin.value(),
+            "bankroll": self.bankroll_spin.value(),
+            "rounding": self.rounding_spin.value(),
+            "max_per_book": self.max_per_book_spin.value(),
+            "min_books": self.min_books_spin.value(),
+            "scan_mode": self.scan_mode_combo.currentText(),
+            "interval": self.interval_spin.value(),
+            "burst_interval": self.burst_interval_spin.value(),
+            "burst_window": self.burst_window_spin.value(),
+        }
+
+    def _prompt_save_profile(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        if not ok:
+            return
+        preset_name = name.strip()
+        if not preset_name:
+            QMessageBox.warning(self, "Invalid name", "Preset name cannot be empty.")
+            return
+        payload = self._collect_profile_payload()
+        self._db.save_profile(preset_name, payload)
+        self._reload_profiles(select=preset_name)
+
+    def _load_selected_profile(self) -> None:
+        name = self.profile_combo.currentData()
+        if not name:
+            QMessageBox.information(self, "No preset", "Select a preset to load.")
+            return
+        profile = self._db.get_profile(name)
+        if not profile:
+            QMessageBox.warning(self, "Missing preset", "The selected preset could not be loaded.")
+            self._reload_profiles()
+            return
+        self._apply_profile(profile)
+        QMessageBox.information(self, "Preset loaded", f"Applied preset '{name}'.")
+
+    def _delete_selected_profile(self) -> None:
+        name = self.profile_combo.currentData()
+        if not name:
+            QMessageBox.information(self, "No preset", "Select a preset to delete.")
+            return
+        if QMessageBox.question(self, "Delete preset", f"Remove preset '{name}'?") != QMessageBox.Yes:
+            return
+        self._db.delete_profile(name)
+        self._reload_profiles()
+
+    def _reload_profiles(self, select: Optional[str] = None) -> None:
+        profiles = self._db.list_profiles()
+        current = select or self.profile_combo.currentData()
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItem("Select preset…", userData=None)
+        for name in profiles:
+            self.profile_combo.addItem(name, userData=name)
+        if current and current in profiles:
+            index = self.profile_combo.findData(current)
+            if index >= 0:
+                self.profile_combo.setCurrentIndex(index)
+        else:
+            self.profile_combo.setCurrentIndex(0)
+        self.profile_combo.blockSignals(False)
+        self._update_profile_buttons()
+
+    def _update_profile_buttons(self) -> None:
+        has_selection = bool(self.profile_combo.currentData())
+        self.load_profile_button.setEnabled(has_selection)
+        self.delete_profile_button.setEnabled(has_selection)
+
     def _open_deep_market_browser(self) -> None:
         api_key = self.api_key_edit.text().strip()
         if not api_key:
@@ -536,6 +661,78 @@ class SettingsTab(QWidget):
             self._per_sport_deep_markets = dialog.sport_overrides
             self._refresh_deep_market_summary()
 
+    def _apply_profile(self, profile: dict) -> None:
+        api_key = profile.get("api_key", "")
+        self.api_key_edit.setText(api_key)
+
+        regions = profile.get("regions") or ["us"]
+        for index in range(self.region_box.count()):
+            item = self.region_box.item(index)
+            item.setSelected(item.text() in regions)
+
+        self._set_selected_sports(profile.get("sports") or [])
+        self._set_selected_bookmakers(profile.get("bookmakers") or [])
+
+        markets = profile.get("markets") or []
+        selected_markets = set(markets) if markets else {item.text() for item in self._iter_items(self.markets_box)}
+        for item in self._iter_items(self.markets_box):
+            item.setSelected(item.text() in selected_markets)
+
+        self.deep_markets_edit.setText(profile.get("deep_markets", ""))
+        self._per_sport_deep_markets = {
+            key: list(values) for key, values in (profile.get("per_sport_deep_markets") or {}).items()
+        }
+        self._refresh_deep_market_summary()
+
+        start = _parse_iso_datetime(profile.get("window_start"))
+        end = _parse_iso_datetime(profile.get("window_end"))
+        preset = profile.get("window_preset")
+        if preset in self._window_presets:
+            self.window_preset_combo.setCurrentText(preset)
+        else:
+            self.window_preset_combo.setCurrentText("Custom range")
+            self.window_start.setEnabled(True)
+            self.window_end.setEnabled(True)
+        if start:
+            self.window_start.setDateTime(QDateTime(start).toLocalTime())
+        if end:
+            self.window_end.setDateTime(QDateTime(end).toLocalTime())
+
+        self.edge_spin.setValue(float(profile.get("min_edge", self.edge_spin.value())))
+        self.bankroll_spin.setValue(float(profile.get("bankroll", self.bankroll_spin.value())))
+        self.rounding_spin.setValue(float(profile.get("rounding", self.rounding_spin.value())))
+        self.max_per_book_spin.setValue(float(profile.get("max_per_book", self.max_per_book_spin.value())))
+        self.min_books_spin.setValue(int(profile.get("min_books", self.min_books_spin.value())))
+
+        scan_mode = profile.get("scan_mode")
+        if scan_mode in [mode.value for mode in ScanMode]:
+            self.scan_mode_combo.setCurrentText(scan_mode)
+
+        self.interval_spin.setValue(int(profile.get("interval", self.interval_spin.value())))
+        self.burst_interval_spin.setValue(int(profile.get("burst_interval", self.burst_interval_spin.value())))
+        self.burst_window_spin.setValue(int(profile.get("burst_window", self.burst_window_spin.value())))
+
+    def _set_selected_sports(self, sports: List[str]) -> None:
+        available = {sport.key for sport in self._available_sports}
+        filtered = [sport for sport in sports if sport in available]
+        if not filtered:
+            filtered = list(available)
+        self._selected_sports = filtered
+        self._refresh_sport_summary()
+
+    def _set_selected_bookmakers(self, bookmakers: List[str]) -> None:
+        available = {book.key for book in self._available_bookmakers}
+        filtered = [book for book in bookmakers if book in available]
+        if not filtered:
+            filtered = list(available)
+        self._selected_bookmakers = filtered
+        self._refresh_bookmaker_summary()
+
+    @staticmethod
+    def _iter_items(widget: QListWidget) -> Iterable[QListWidgetItem]:
+        for index in range(widget.count()):
+            yield widget.item(index)
+
     def _on_preset_changed(self, preset: str) -> None:
         if preset == "Custom range":
             self.window_start.setEnabled(True)
@@ -555,6 +752,7 @@ class SettingsTab(QWidget):
 
 class ArbitrageTab(QWidget):
     rescan_requested = Signal(str, str, str)
+    delete_requested = Signal(int)
 
     def __init__(self, database: Database, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -616,12 +814,15 @@ class ArbitrageTab(QWidget):
             rec_item = QTableWidgetItem(recommendation_text)
             rec_item.setToolTip(recommendation_text)
             self.table.setItem(row_idx, 6, rec_item)
-            button = self._make_rescan_button(record)
-            self.table.setCellWidget(row_idx, 7, button)
+            actions_widget = self._make_actions_widget(record)
+            self.table.setCellWidget(row_idx, 7, actions_widget)
         self.table.resizeRowsToContents()
 
-    def _make_rescan_button(self, record: ArbitrageRecord) -> QPushButton:
-        button = QPushButton("Rescan")
+    def _make_actions_widget(self, record: ArbitrageRecord) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        rescan_button = QPushButton("Rescan")
         if record.sport_key:
             callback = partial(
                 self.rescan_requested.emit,
@@ -629,11 +830,16 @@ class ArbitrageTab(QWidget):
                 record.sport_key,
                 record.market_key,
             )
-            button.clicked.connect(callback)
+            rescan_button.clicked.connect(callback)
         else:
-            button.setEnabled(False)
-            button.setToolTip("Sport information unavailable for this record.")
-        return button
+            rescan_button.setEnabled(False)
+            rescan_button.setToolTip("Sport information unavailable for this record.")
+        delete_button = QPushButton("Delete")
+        delete_button.clicked.connect(partial(self.delete_requested.emit, record.id))
+        layout.addWidget(rescan_button)
+        layout.addWidget(delete_button)
+        layout.addStretch()
+        return container
 
     @staticmethod
     def _format_recommendations(details: List[dict]) -> str:
@@ -730,7 +936,12 @@ class LogsTab(QWidget):
         self._append_entry(record)
 
     def _poll_logs(self) -> None:
-        records = self._db.fetch_logs(since_id=self._last_log_id)
+        try:
+            records = self._db.fetch_logs(since_id=self._last_log_id)
+        except Exception as exc:  # pragma: no cover - defensive UI guard
+            timestamp = datetime.utcnow().isoformat()
+            self.raw_view.append(f"[{timestamp}] ERROR: Log fetch failed ({exc})")
+            return
         for record in records:
             self._append_entry(record)
             self._last_log_id = record.id
@@ -832,7 +1043,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
 
         self.settings_tab.config_applied.connect(self._on_config_applied)
+        self.settings_tab.clear_cache_requested.connect(self._clear_event_cache)
         self.arbitrage_tab.rescan_requested.connect(self._handle_rescan_request)
+        self.arbitrage_tab.delete_requested.connect(self._handle_delete_request)
 
         toolbar = self.addToolBar("Controls")
         self.snapshot_action = QAction("Run Snapshot", self)
@@ -848,10 +1061,28 @@ class MainWindow(QMainWindow):
 
     @Slot(ScanConfig, OddsApiClient)
     def _on_config_applied(self, config: ScanConfig, client: OddsApiClient) -> None:
+        if self._controller:
+            try:
+                self._controller.stop()
+            except Exception:
+                pass
         self._config = config
         self._client = client
         self._controller = ScanController(client, self._db, self._name_normalizer)
         self.dashboard_tab.update_status("Configuration applied. Ready to scan.")
+
+    def _clear_event_cache(self) -> None:
+        if QMessageBox.question(
+            self,
+            "Clear cached events",
+            "Are you sure you want to delete all stored events and quotes?",
+        ) != QMessageBox.Yes:
+            return
+        self._db.clear_event_cache()
+        if self._controller:
+            self._controller.reset_runtime_state()
+        self.dashboard_tab.refresh()
+        QMessageBox.information(self, "Cache cleared", "Stored events removed.")
 
     def _ensure_config(self) -> bool:
         if not self._config or not self._controller:
@@ -927,9 +1158,29 @@ class MainWindow(QMainWindow):
         status_map = {
             "no_quotes": "No quotes were available for the selected market.",
             "no_arbitrage": "The current odds no longer form an arbitrage opportunity.",
+            "no_bookmakers": "Configured bookmakers were rejected by the Odds API.",
         }
         details.append(status_map.get(result.status, "No arbitrage opportunity detected."))
         QMessageBox.information(self, "Rescan result", "\n".join(details))
+
+    @Slot(int)
+    def _handle_delete_request(self, record_id: int) -> None:
+        if QMessageBox.question(
+            self,
+            "Delete opportunity",
+            "Remove this arbitrage record from history?",
+        ) != QMessageBox.Yes:
+            return
+        self._db.delete_arbitrage(record_id)
+        self.arbitrage_tab.refresh()
+        self.dashboard_tab.refresh()
+        QMessageBox.information(self, "Deleted", "Arbitrage record removed.")
+
+    def closeEvent(self, event) -> None:  # pragma: no cover - UI shutdown handling
+        try:
+            self._stop_scanning()
+        finally:
+            super().closeEvent(event)
 
 
 class DeepMarketExplorerDialog(QDialog):
@@ -1112,6 +1363,18 @@ def _extract_market_keys(payload: object) -> List[str]:
             results.append(value)
         return results
     return []
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _stringify(value: object) -> str:
