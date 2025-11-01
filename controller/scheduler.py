@@ -481,6 +481,7 @@ class ScanController:
         quotes_collected = 0
         markets_seen = 0
         opportunities_tested = 0
+        skipped_min_books = 0
         events = response.data or []
         if isinstance(events, dict):
             events = [events]
@@ -537,6 +538,7 @@ class ScanController:
             for market_key, quotes in market_quotes.items():
                 markets_seen += 1
                 if len(quotes) < config.min_book_count:
+                    skipped_min_books += 1
                     continue
                 best_prices = select_best_prices(quotes)
                 opportunities_tested += 1
@@ -569,6 +571,7 @@ class ScanController:
             "quotes_collected": quotes_collected,
             "opportunities_found": opportunities_found,
             "opportunities_tested": opportunities_tested,
+            "skipped_min_books": skipped_min_books,
         }
         return upcoming_within_burst, opportunities_found, events_considered, context
 

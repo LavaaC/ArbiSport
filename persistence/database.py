@@ -191,6 +191,11 @@ class Database:
             )
 
     def log_api_usage(self, remaining: Optional[int], reset_time: Optional[datetime]) -> None:
+        if remaining is None and reset_time is None:
+            # Skip creating a log entry when the API does not provide any usage
+            # headers; this preserves the most recent known quota information.
+            return
+
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO api_usage (created_at, remaining, reset_time) VALUES (?, ?, ?)",

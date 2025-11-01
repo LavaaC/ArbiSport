@@ -5,13 +5,22 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from PySide6.QtCore import QDateTime, QRunnable, Qt, QThreadPool, Signal, Slot, QTimer
+from PySide6.QtCore import (
+    QDateTime,
+    QRunnable,
+    Qt,
+    QThreadPool,
+    Signal,
+    Slot,
+    QTimer,
+    QObject,
+)
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -143,6 +152,7 @@ class MultiSelectDialog(QDialog):
 class SettingsTab(QWidget):
     config_applied = Signal(ScanConfig, OddsApiClient)
     clear_cache_requested = Signal()
+    catalog_updated = Signal(object, object)
 
     def __init__(self, database: Database, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -228,8 +238,10 @@ class SettingsTab(QWidget):
         self.deep_markets_edit = QLineEdit()
         self.deep_markets_edit.setPlaceholderText("Comma-separated deep markets (e.g., correct_score)")
         self.deep_market_browser = QPushButton("Browse…")
+        self.clear_deep_overrides_button = QPushButton("Clear sport overrides")
         deep_market_row.addWidget(self.deep_markets_edit)
         deep_market_row.addWidget(self.deep_market_browser)
+        deep_market_row.addWidget(self.clear_deep_overrides_button)
         deep_market_widget = QWidget()
         deep_market_widget.setLayout(deep_market_row)
         form_layout.addRow("Deep markets", deep_market_widget)
@@ -320,6 +332,7 @@ class SettingsTab(QWidget):
         self.clear_cache_button.clicked.connect(self._on_clear_cache)
         self.window_preset_combo.currentTextChanged.connect(self._on_preset_changed)
         self.deep_market_browser.clicked.connect(self._open_deep_market_browser)
+        self.clear_deep_overrides_button.clicked.connect(self._clear_deep_market_overrides)
         self.sports_browse_button.clicked.connect(self._open_sport_browser)
         self.bookmakers_browse_button.clicked.connect(self._open_bookmaker_browser)
         self._on_preset_changed(self.window_preset_combo.currentText())
@@ -412,6 +425,20 @@ class SettingsTab(QWidget):
             parts.append(f"{title_map.get(sport_key, sport_key)}: {display}")
         self.deep_market_summary.setText("; ".join(parts) if parts else "Applies to all selected sports")
 
+    def _clear_deep_market_overrides(self) -> None:
+        if not self._per_sport_deep_markets:
+            QMessageBox.information(self, "No overrides", "There are no sport-specific deep market overrides to clear.")
+            return
+        reply = QMessageBox.question(
+            self,
+            "Clear overrides",
+            "Remove all sport-specific deep market selections?",
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._per_sport_deep_markets.clear()
+        self._refresh_deep_market_summary()
+
     def _on_test_api(self) -> None:
         api_key = self.api_key_edit.text().strip()
         if not api_key:
@@ -497,6 +524,8 @@ class SettingsTab(QWidget):
             self._selected_bookmakers = list(available_book_keys)
         self._refresh_bookmaker_summary()
         self._refresh_deep_market_summary()
+
+        self.catalog_updated.emit(self._available_sports, self._available_bookmakers)
 
         QMessageBox.information(
             self,
@@ -886,6 +915,375 @@ class ArbitrageTab(QWidget):
         QMessageBox.information(self, "Export complete", f"Saved history to {path}")
 
 
+class EventSearchSignals(QObject):
+    finished = Signal(object, object, object, object)
+
+
+class EventSearchRunnable(QRunnable):
+    def __init__(
+        self,
+        client: OddsApiClient,
+        sports: Sequence[str],
+        regions: Sequence[str],
+        bookmakers: Sequence[str],
+        window_start: datetime,
+        window_end: datetime,
+        include_live: bool,
+        sport_lookup: Dict[str, str],
+    ) -> None:
+        super().__init__()
+        self._client = client
+        self._sports = list(dict.fromkeys(sports))
+        self._regions = list(dict.fromkeys(regions)) or ["us"]
+        self._bookmakers = list(dict.fromkeys(bookmakers))
+        self._window_start = window_start
+        self._window_end = window_end
+        self._include_live = include_live
+        self._sport_lookup = dict(sport_lookup)
+        self._markets = ["h2h"]
+        self.signals = EventSearchSignals()
+
+    def run(self) -> None:  # pragma: no cover - executed in background thread
+        results: List[dict] = []
+        errors: List[str] = []
+        remaining: Optional[int] = None
+        reset: Optional[datetime] = None
+        now = datetime.now(timezone.utc)
+        seen_ids: set[str] = set()
+
+        for sport in self._sports:
+            try:
+                response = self._client.get_odds(
+                    sport_key=sport,
+                    regions=self._regions,
+                    bookmakers=self._bookmakers,
+                    markets=self._markets,
+                )
+            except Exception as exc:  # pragma: no cover - API failures routed to UI
+                errors.append(f"{sport}: {exc}")
+                continue
+
+            if response.remaining_requests is not None:
+                remaining = response.remaining_requests
+            if response.reset_time is not None:
+                reset = response.reset_time
+
+            for event in response.data or []:
+                if not isinstance(event, dict):
+                    continue
+                event_id = event.get("id")
+                if event_id and event_id in seen_ids:
+                    continue
+                commence = _parse_commence_time(event.get("commence_time"))
+                if not commence:
+                    continue
+                commence_utc = _ensure_utc(commence)
+                if commence_utc > self._window_end:
+                    continue
+                if commence_utc < self._window_start:
+                    if not (self._include_live and commence_utc <= now <= self._window_end):
+                        continue
+                if event_id:
+                    seen_ids.add(event_id)
+                bookmakers = _extract_bookmakers(event)
+                results.append(
+                    {
+                        "sport_key": sport,
+                        "sport_title": self._sport_lookup.get(sport, sport),
+                        "event_id": event_id or f"{sport}-{len(results)}",
+                        "event_name": _format_event_name(event),
+                        "commence": commence_utc,
+                        "bookmakers": bookmakers,
+                        "is_live": commence_utc <= now,
+                    }
+                )
+
+        results.sort(key=lambda entry: entry["commence"])
+        self.signals.finished.emit(results, errors, remaining, reset)
+
+
+class EventSearchTab(QWidget):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._thread_pool = QThreadPool.globalInstance()
+        self._client: Optional[OddsApiClient] = None
+        self._regions: List[str] = ["us"]
+        self._bookmakers: List[str] = []
+        self._available_sports: List[SportInfo] = list(ALL_SPORTS)
+        self._sport_lookup: Dict[str, str] = {sport.key: sport.title for sport in self._available_sports}
+        self._selected_sports: List[str] = [sport.key for sport in self._available_sports]
+        self._results: List[dict] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        description = QLabel("Search across sports for live and upcoming events within a custom window.")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        form = QFormLayout()
+
+        sports_row = QHBoxLayout()
+        self.sport_summary = QLabel()
+        self.sport_summary.setWordWrap(True)
+        self.sport_summary.setMinimumWidth(300)
+        self.sport_browse_button = QPushButton("Browse…")
+        sports_row.addWidget(self.sport_summary, 1)
+        sports_row.addWidget(self.sport_browse_button)
+        sports_widget = QWidget()
+        sports_widget.setLayout(sports_row)
+        form.addRow("Sports", sports_widget)
+
+        self.window_start_edit = QDateTimeEdit(QDateTime.currentDateTime())
+        self.window_start_edit.setCalendarPopup(True)
+        self.window_start_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        form.addRow("Window start", self.window_start_edit)
+
+        self.hours_ahead_spin = QSpinBox()
+        self.hours_ahead_spin.setRange(1, 72)
+        self.hours_ahead_spin.setValue(6)
+        form.addRow("Hours ahead", self.hours_ahead_spin)
+
+        self.include_live_checkbox = QCheckBox("Include events that have already started")
+        form.addRow("", self.include_live_checkbox)
+
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter results…")
+        form.addRow("Filter", self.filter_edit)
+
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        self.search_button = QPushButton("Search")
+        self.clear_button = QPushButton("Clear results")
+        self.clear_button.setEnabled(False)
+        button_row.addWidget(self.search_button)
+        button_row.addWidget(self.clear_button)
+        layout.addLayout(button_row)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Sport", "Event", "Start (local)", "Status", "Bookmakers"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.table)
+
+        self.status_label = QLabel("Enter an API key and apply settings to search.")
+        layout.addWidget(self.status_label)
+
+        self.sport_browse_button.clicked.connect(self._open_sport_browser)
+        self.search_button.clicked.connect(self._run_search)
+        self.clear_button.clicked.connect(self._clear_results)
+        self.filter_edit.textChanged.connect(self._apply_filter)
+
+        self._refresh_sport_summary()
+
+    def update_catalog(self, sports: Sequence[SportInfo]) -> None:
+        self._available_sports = list(sports) if sports else list(ALL_SPORTS)
+        self._sport_lookup = {sport.key: sport.title for sport in self._available_sports}
+        available_keys = [sport.key for sport in self._available_sports]
+        self._selected_sports = [key for key in self._selected_sports if key in available_keys]
+        if not self._selected_sports:
+            self._selected_sports = list(available_keys)
+        self._refresh_sport_summary()
+
+    def apply_config(self, config: ScanConfig, client: OddsApiClient) -> None:
+        self._client = client
+        self._regions = list(config.regions)
+        self._bookmakers = list(config.bookmakers)
+        if config.sports:
+            self._selected_sports = list(dict.fromkeys(config.sports))
+        self._refresh_sport_summary()
+        self.status_label.setText("Ready to search.")
+
+    def _open_sport_browser(self) -> None:
+        items = [
+            SelectionItem(key=sport.key, label=f"{sport.title} ({sport.group})", description=sport.key)
+            for sport in self._available_sports
+        ]
+        dialog = MultiSelectDialog("Select sports", items, self._selected_sports, self)
+        if dialog.exec() == QDialog.Accepted:
+            self._selected_sports = dialog.selected_keys or [sport.key for sport in self._available_sports]
+            self._refresh_sport_summary()
+
+    def _refresh_sport_summary(self) -> None:
+        label_map = {sport.key: f"{sport.title} ({sport.group})" for sport in self._available_sports}
+        summary = self._format_selection_summary(self._selected_sports, label_map, len(self._available_sports))
+        self.sport_summary.setText(summary)
+
+    def _run_search(self) -> None:
+        if not self._client:
+            QMessageBox.warning(self, "Configuration required", "Apply settings with a valid API key before searching.")
+            return
+        sports = self._selected_sports or [sport.key for sport in self._available_sports]
+        if not sports:
+            QMessageBox.warning(self, "No sports", "Select at least one sport to search.")
+            return
+
+        start_dt = self.window_start_edit.dateTime().toUTC().toPyDateTime().replace(tzinfo=timezone.utc)
+        window_end = start_dt + timedelta(hours=self.hours_ahead_spin.value())
+        include_live = self.include_live_checkbox.isChecked()
+
+        runnable = EventSearchRunnable(
+            self._client,
+            sports,
+            self._regions,
+            self._bookmakers,
+            start_dt,
+            window_end,
+            include_live,
+            self._sport_lookup,
+        )
+        runnable.signals.finished.connect(self._on_search_finished)
+        self.status_label.setText("Searching…")
+        self.search_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
+        self._thread_pool.start(runnable)
+
+    def _on_search_finished(
+        self,
+        results: List[dict],
+        errors: List[str],
+        remaining: Optional[int],
+        reset: Optional[datetime],
+    ) -> None:
+        self.search_button.setEnabled(True)
+        self._results = results or []
+        self.clear_button.setEnabled(bool(self._results))
+        self._apply_filter()
+
+        parts = [f"Found {len(self._results)} events."]
+        if remaining is not None:
+            parts.append(f"API credits remaining: {remaining}")
+        if reset is not None:
+            parts.append(f"Reset at {reset.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        if errors:
+            preview = "; ".join(errors[:3])
+            if len(errors) > 3:
+                preview += f" … (+{len(errors) - 3} more)"
+            parts.append(f"Errors: {preview}")
+        self.status_label.setText(" ".join(parts))
+
+    def _apply_filter(self) -> None:
+        query = self.filter_edit.text().strip().casefold()
+        if not query:
+            filtered = list(self._results)
+        else:
+            filtered = []
+            for entry in self._results:
+                haystack = " ".join(
+                    [
+                        entry.get("sport_title", ""),
+                        entry.get("event_name", ""),
+                        " ".join(entry.get("bookmakers", [])),
+                    ]
+                ).casefold()
+                if query in haystack:
+                    filtered.append(entry)
+        self._populate_table(filtered)
+
+    def _populate_table(self, entries: Sequence[dict]) -> None:
+        self.table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            self.table.setItem(row, 0, QTableWidgetItem(entry.get("sport_title", entry.get("sport_key", ""))))
+            self.table.setItem(row, 1, QTableWidgetItem(entry.get("event_name", "")))
+            commence: Optional[datetime] = entry.get("commence")
+            self.table.setItem(row, 2, QTableWidgetItem(_format_local_time(commence)))
+            status = "Live" if entry.get("is_live") else "Upcoming"
+            self.table.setItem(row, 3, QTableWidgetItem(status))
+            self.table.setItem(row, 4, QTableWidgetItem(_format_bookmakers(entry.get("bookmakers", []))))
+        if entries:
+            self.table.scrollToTop()
+
+    def _clear_results(self) -> None:
+        self._results = []
+        self.table.setRowCount(0)
+        self.filter_edit.clear()
+        self.clear_button.setEnabled(False)
+        self.status_label.setText("Results cleared.")
+
+    @staticmethod
+    def _format_selection_summary(
+        selected_keys: Sequence[str],
+        label_map: Dict[str, str],
+        total_available: int,
+    ) -> str:
+        if not selected_keys or set(selected_keys) == set(label_map.keys()):
+            return f"All ({total_available})"
+        names = [label_map.get(key, "") for key in selected_keys if label_map.get(key, "")]
+        if not names:
+            return "None selected"
+        if len(names) > 5:
+            return ", ".join(names[:5]) + f" … (+{len(names) - 5})"
+        return ", ".join(names)
+
+
+def _parse_commence_time(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _format_event_name(event: dict) -> str:
+    home = event.get("home_team") if isinstance(event, dict) else None
+    away = event.get("away_team") if isinstance(event, dict) else None
+    if isinstance(home, str) and isinstance(away, str) and home and away:
+        return f"{away} @ {home}"
+    name = event.get("sport_title") if isinstance(event, dict) else None
+    if isinstance(name, str) and name:
+        return name
+    event_id = event.get("id") if isinstance(event, dict) else None
+    return event_id or "Unknown event"
+
+
+def _extract_bookmakers(event: dict) -> List[str]:
+    bookmakers: List[str] = []
+    raw = event.get("bookmakers") if isinstance(event, dict) else None
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            title = entry.get("title") or entry.get("key")
+            if not title:
+                continue
+            bookmakers.append(str(title))
+    return list(dict.fromkeys(bookmakers))
+
+
+def _format_local_time(value: Optional[datetime]) -> str:
+    if not value:
+        return "—"
+    local = value.astimezone()
+    return local.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_bookmakers(bookmakers: Sequence[str]) -> str:
+    unique = [book for book in dict.fromkeys(bookmakers) if book]
+    if not unique:
+        return "—"
+    if len(unique) <= 3:
+        return ", ".join(unique)
+    return ", ".join(unique[:3]) + f" … (+{len(unique) - 3})"
+
+
 class LogsTab(QWidget):
     def __init__(self, database: Database, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1056,18 +1454,23 @@ class MainWindow(QMainWindow):
         self.settings_tab = SettingsTab(database)
         self.dashboard_tab = DashboardTab(database)
         self.arbitrage_tab = ArbitrageTab(database)
+        self.events_tab = EventSearchTab()
         self.logs_tab = LogsTab(database)
 
         self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
         self.tabs.addTab(self.arbitrage_tab, "Arbitrage")
+        self.tabs.addTab(self.events_tab, "Events")
         self.tabs.addTab(self.logs_tab, "Logs")
         self.setCentralWidget(self.tabs)
 
         self.settings_tab.config_applied.connect(self._on_config_applied)
         self.settings_tab.clear_cache_requested.connect(self._clear_event_cache)
+        self.settings_tab.catalog_updated.connect(self._on_catalog_updated)
         self.arbitrage_tab.rescan_requested.connect(self._handle_rescan_request)
         self.arbitrage_tab.delete_requested.connect(self._handle_delete_request)
+
+        self.events_tab.update_catalog(list(ALL_SPORTS))
 
         toolbar = self.addToolBar("Controls")
         self.snapshot_action = QAction("Run Snapshot", self)
@@ -1092,6 +1495,12 @@ class MainWindow(QMainWindow):
         self._client = client
         self._controller = ScanController(client, self._db, self._name_normalizer)
         self.dashboard_tab.update_status("Configuration applied. Ready to scan.")
+        self.events_tab.apply_config(config, client)
+
+    @Slot(object, object)
+    def _on_catalog_updated(self, sports: object, _: object) -> None:
+        if isinstance(sports, list):
+            self.events_tab.update_catalog(sports)
 
     def _clear_event_cache(self) -> None:
         if QMessageBox.question(
@@ -1256,12 +1665,14 @@ class DeepMarketExplorerDialog(QDialog):
         self.refresh_button = QPushButton("Scan markets")
         self.select_all_button = QPushButton("Select all")
         self.clear_button = QPushButton("Clear")
+        self.remove_button = QPushButton("Remove override")
         self.save_button = QPushButton("Save sport selection")
         self.done_button = QPushButton("Done")
         button_row.addWidget(self.refresh_button)
         button_row.addWidget(self.select_all_button)
         button_row.addWidget(self.clear_button)
         button_row.addStretch()
+        button_row.addWidget(self.remove_button)
         button_row.addWidget(self.save_button)
         button_row.addWidget(self.done_button)
         layout.addLayout(button_row)
@@ -1273,6 +1684,7 @@ class DeepMarketExplorerDialog(QDialog):
         self.refresh_button.clicked.connect(lambda: self._load_markets_for_sport(self._current_sport_key()))
         self.select_all_button.clicked.connect(self._select_all)
         self.clear_button.clicked.connect(self._clear_selection)
+        self.remove_button.clicked.connect(self._remove_current_override)
         self.save_button.clicked.connect(self._save_current_selection)
         self.done_button.clicked.connect(self._finish)
         self.search_edit.textChanged.connect(self._filter_markets)
@@ -1353,6 +1765,20 @@ class DeepMarketExplorerDialog(QDialog):
     def _finish(self) -> None:
         self._save_current_selection(silent=True)
         self.accept()
+
+    def _remove_current_override(self) -> None:
+        sport_key = self._current_sport_key()
+        if not sport_key:
+            return
+        if sport_key in self.sport_overrides:
+            del self.sport_overrides[sport_key]
+            self.status_label.setText(f"Removed saved markets for {sport_key}.")
+        self.use_all_checkbox.setChecked(False)
+        for index in range(self.market_list.count()):
+            self.market_list.item(index).setSelected(False)
+        self.global_markets = sorted(
+            {market for values in self.sport_overrides.values() for market in values}
+        )
 
     def _filter_markets(self, text: str) -> None:
         query = text.strip().casefold()
